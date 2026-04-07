@@ -54,6 +54,16 @@ Examples:
 * Click the `Setup.bat` script to launch the setup process that creates a new Python virtual environment and downloads the required dependencies (via `requirements.txt`) thru PIP.
 * Once the setup script is done, click on `SongPi.py` and the app will launch, play some music to start the recognition!
 
+## Running **SongPi** on macOS
+
+1. Install Python 3 (https://www.python.org/downloads/ or via Homebrew).
+2. If PyAudio fails to build, install PortAudio first using Homebrew: `brew install portaudio`.
+3. From the `SongPi - full Windows` directory, run `./setup_macos.sh` once to create a virtual environment and install dependencies from `Files/requirements.txt`.
+4. Launch the app anytime with `./run_macos.sh` (it activates the venv and runs `Files/shazam.py` for you).
+5. Leave `audio.device_index` as `null` in `Files/config.json` to auto-select an input device, or set a specific index if you know it.
+6. On Python 3.13+ (where `audioop` was removed), the included `audioop-lts` dependency restores it automatically—if you set up before this note, delete `Files/venv` and re-run `./setup_macos.sh`.
+7. If you hit a segfault importing `shazamio_core`, wipe `Files/venv` and re-run `./setup_macos.sh`; `requirements.txt` pins `shazamio==0.7.0` (pure Python) to avoid native-core crashes on macOS.
+
 
 ## Running **SongPi** on Linux
 
