@@ -1,0 +1,26 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+.venv*/
+*/venv/
+/bin/
+/include/
+/lib/
+/pyvenv.cfg
+
+# OS cruft
+.DS_Store
+
+# Build/output artifacts
+dist/
+build/
+*.egg-info/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
