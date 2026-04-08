@@ -12,6 +12,17 @@ venv/
 /lib/
 /pyvenv.cfg
 
+# App-generated files
+history_images/
+song_history.log
+last_state.json
+image.jpg
+image_temp.jpg
+/bin/
+/include/
+/lib/
+/pyvenv.cfg
+
 # OS cruft
 .DS_Store
 

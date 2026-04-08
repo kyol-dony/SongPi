@@ -56,13 +56,23 @@ Examples:
 
 ## Running **SongPi** on macOS
 
-1. Install Python 3.12 (https://www.python.org/downloads/ or via Homebrew).
-2. If PyAudio fails to build, install PortAudio first using Homebrew: `brew install portaudio`.
-3. From the `SongPi - full Windows` directory, run `./setup_macos.sh` once to create a virtual environment and install dependencies from `Files/requirements.txt`.
-4. Launch the app anytime with `./run_macos.sh` (it activates the venv and runs `Files/shazam.py` for you).
-5. Leave `audio.device_index` as `null` in `Files/config.json` to auto-select an input device, or set a specific index if you know it.
-6. On Python 3.13+ (where `audioop` was removed), the included `audioop-lts` dependency restores it automatically—if you set up before this note, delete `Files/venv` and re-run `./setup_macos.sh`.
-7. If you hit a segfault importing `shazamio_core`, wipe `Files/venv` and re-run `./setup_macos.sh`; `requirements.txt` pins `shazamio==0.7.0` (pure Python) to avoid native-core crashes on macOS.
+1. Install Python 3.12 (python.org pkg or `brew install python@3.12`).
+2. If PyAudio build fails: `brew install portaudio`, then rerun setup.
+3. From `SongPi_full_Windows`, create the venv and install deps:
+    ```
+    rm -rf Files/venv
+    PYTHON_BIN=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 ./setup_macos.sh
+    
+    # Homebrew 3.12 alternative:
+    PATH="/opt/homebrew/opt/python@3.12/bin:$PATH" PYTHON_BIN=python3.12 ./setup_macos.sh
+    ```
+4. Launch anytime with:
+    ```
+    ./run_macos.sh
+    ```
+5. Audio input: leave `audio.device_index` as `null` in `Files/config.json` to auto-select, or set a specific index after checking the console device list.
+6. Dependencies: `shazamio==0.7.0` (pure Python) and `numpy==2.1.2` assume Python 3.12 wheels. Python 3.14 will try to compile numpy and fail—stay on 3.12.
+7. If you hit a segfault importing `shazamio_core` or a numpy build error, delete `Files/venv` and rerun the setup commands above.
 
 
 ## Running **SongPi** on Linux
