@@ -56,7 +56,7 @@ Examples:
 
 ## Running **SongPi** on macOS
 
-1. Install Python 3 (https://www.python.org/downloads/ or via Homebrew).
+1. Install Python 3.12 (https://www.python.org/downloads/ or via Homebrew).
 2. If PyAudio fails to build, install PortAudio first using Homebrew: `brew install portaudio`.
 3. From the `SongPi - full Windows` directory, run `./setup_macos.sh` once to create a virtual environment and install dependencies from `Files/requirements.txt`.
 4. Launch the app anytime with `./run_macos.sh` (it activates the venv and runs `Files/shazam.py` for you).
