@@ -101,7 +101,7 @@ Examples:
 
 ---
 
-## What's New in v1.1 (Latest Version)
+## What's New in v1.2 (Latest Version)
 
 Version 1.1 introduces significant enhancements over previous versions, focusing on user experience, reliability, and new functionalities:
 
