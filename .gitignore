@@ -16,6 +16,7 @@ venv/
 history_images/
 song_history.log
 last_state.json
+history_state.json
 image.jpg
 image_temp.jpg
 /bin/
