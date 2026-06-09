@@ -104,6 +104,15 @@ track_change_state: Dict[str, Any] = {
 }
 track_change_job_id: Optional[str] = None
 
+ken_burns_frame_a_ref: Optional["ImageTk.PhotoImage"] = None
+ken_burns_frame_b_ref: Optional["ImageTk.PhotoImage"] = None
+ken_burns_item_a: Optional[int] = None
+ken_burns_item_b: Optional[int] = None
+ken_burns_phase: float = 0.0
+ken_burns_direction: int = 1
+ken_burns_job_id: Optional[str] = None
+ken_burns_last_window_size: Tuple[int, int] = (0, 0)
+
 idle_splash_active: bool = False
 idle_splash_bg_id: Optional[int] = None
 idle_splash_bg_photo_ref: Optional["ImageTk.PhotoImage"] = None
@@ -714,6 +723,97 @@ def apply_vignette(image: Image.Image, intensity: float = 0.55) -> Image.Image:
     except Exception as e:
         logger.debug(f"Vignette failed: {e}")
         return image
+
+
+def build_ken_burns_frames(source_image_path: Path, width: int, height: int,
+                           blur_strength: int, vignette_intensity: float) -> Optional[Tuple[Image.Image, Image.Image]]:
+    """Pre-renders two slightly-different zoom/translate variants of the
+    blurred+vignetted backdrop. Tk crossfades between them."""
+    try:
+        base = create_blurred_background(source_image_path, width, height, blur_strength)
+        if base is None:
+            return None
+        base = apply_vignette(base, intensity=vignette_intensity)
+        a = base.resize((int(width * 1.04), int(height * 1.04)), Image.Resampling.LANCZOS)
+        a = a.crop((0, 0, width, height))
+        b = base.resize((int(width * 1.10), int(height * 1.10)), Image.Resampling.LANCZOS)
+        offset_x = (int(width * 1.10) - width)
+        offset_y = (int(height * 1.10) - height)
+        b = b.crop((offset_x, offset_y, offset_x + width, offset_y + height))
+        return a, b
+    except Exception as e:
+        logger.debug(f"build_ken_burns_frames failed: {e}")
+        return None
+
+
+def install_ken_burns(image_file_path: Path, width: int, height: int) -> bool:
+    """Replaces the static blurred background with two crossfading frames."""
+    global ken_burns_frame_a_ref, ken_burns_frame_b_ref
+    global ken_burns_item_a, ken_burns_item_b, ken_burns_last_window_size
+
+    gui_cfg = config.get("gui", {})
+    if not bool(gui_cfg.get("ken_burns_enabled", True)) or not is_motion_enabled(config):
+        return False
+    if not canvas or width <= 0 or height <= 0:
+        return False
+
+    vignette_intensity = safe_float(gui_cfg.get("vignette_intensity")) or 0.55
+    blur_strength = gui_cfg.get("blur_strength", 15)
+    frames = build_ken_burns_frames(image_file_path, width, height, blur_strength, vignette_intensity)
+    if frames is None:
+        return False
+
+    ken_burns_frame_a_ref = ImageTk.PhotoImage(frames[0])
+    ken_burns_frame_b_ref = ImageTk.PhotoImage(frames[1])
+
+    try:
+        canvas.delete("background")
+    except tk.TclError:
+        pass
+
+    ken_burns_item_a = canvas.create_image(0, 0, anchor=tk.NW, image=ken_burns_frame_a_ref,
+                                            tags=("background", "ken_burns"))
+    ken_burns_item_b = canvas.create_image(0, 0, anchor=tk.NW, image=ken_burns_frame_b_ref,
+                                            tags=("background", "ken_burns"), state="hidden")
+    canvas.tag_lower("background")
+    ken_burns_last_window_size = (width, height)
+    return True
+
+
+def tick_ken_burns():
+    """24s cycle that crossfades by toggling visibility of frame A vs frame B at midpoint."""
+    global ken_burns_job_id, ken_burns_phase, ken_burns_direction
+    ken_burns_job_id = None
+    if not root or not canvas or not root.winfo_exists():
+        return
+    if not is_motion_enabled(config) or ken_burns_item_a is None:
+        try:
+            ken_burns_job_id = root.after(2000, tick_ken_burns)
+        except tk.TclError:
+            ken_burns_job_id = None
+        return
+    cycle_seconds = 24.0
+    step = (1.0 / cycle_seconds) * 0.5  # 0.5s tick
+    ken_burns_phase += step * ken_burns_direction
+    if ken_burns_phase >= 1.0:
+        ken_burns_phase = 1.0
+        ken_burns_direction = -1
+    elif ken_burns_phase <= 0.0:
+        ken_burns_phase = 0.0
+        ken_burns_direction = 1
+    try:
+        if ken_burns_phase < 0.5:
+            canvas.itemconfigure(ken_burns_item_a, state="normal")
+            canvas.itemconfigure(ken_burns_item_b, state="hidden")
+        else:
+            canvas.itemconfigure(ken_burns_item_a, state="hidden")
+            canvas.itemconfigure(ken_burns_item_b, state="normal")
+    except tk.TclError:
+        return
+    try:
+        ken_burns_job_id = root.after(500, tick_ken_burns)
+    except tk.TclError:
+        ken_burns_job_id = None
 
 
 SPLASH_STOPS = [
@@ -2861,24 +2961,36 @@ def update_images() -> Dict[str, Any]:
     brightness = 0.2  # With vignette, foreground is always over a darkened scrim.
     try:
         if image_file_path.is_file():
-            blurred_pil_image = create_blurred_background(
-                image_file_path, window_width, window_height, gui_cfg['blur_strength']
-            )
-            if blurred_pil_image:
-                # Extract accent BEFORE vignetting (color is truer pre-darken).
+            # Try Ken Burns crossfade first; fall back to static blurred bg.
+            installed_kb = install_ken_burns(image_file_path, window_width, window_height)
+            if installed_kb:
+                # Accent extract from a fresh pre-vignette frame for true colors.
                 try:
-                    accent_color_hex = extract_accent_color(blurred_pil_image)
+                    pre_vignette = create_blurred_background(
+                        image_file_path, window_width, window_height, gui_cfg['blur_strength']
+                    )
+                    if pre_vignette is not None:
+                        accent_color_hex = extract_accent_color(pre_vignette)
                 except Exception as e:
                     logger.debug(f"Accent extract failed: {e}")
-                vignette_intensity = safe_float(gui_cfg.get("vignette_intensity")) or 0.55
-                blurred_pil_image = apply_vignette(blurred_pil_image, intensity=vignette_intensity)
-                bg_photo_ref = ImageTk.PhotoImage(blurred_pil_image)
-                canvas.delete("background")
-                canvas.create_image(0, 0, anchor=tk.NW, image=bg_photo_ref, tags=("background",))
-                canvas.tag_lower("background")
             else:
-                canvas.delete("background")
-                bg_photo_ref = None
+                blurred_pil_image = create_blurred_background(
+                    image_file_path, window_width, window_height, gui_cfg['blur_strength']
+                )
+                if blurred_pil_image:
+                    try:
+                        accent_color_hex = extract_accent_color(blurred_pil_image)
+                    except Exception as e:
+                        logger.debug(f"Accent extract failed: {e}")
+                    vignette_intensity = safe_float(gui_cfg.get("vignette_intensity")) or 0.55
+                    blurred_pil_image = apply_vignette(blurred_pil_image, intensity=vignette_intensity)
+                    bg_photo_ref = ImageTk.PhotoImage(blurred_pil_image)
+                    canvas.delete("background")
+                    canvas.create_image(0, 0, anchor=tk.NW, image=bg_photo_ref, tags=("background",))
+                    canvas.tag_lower("background")
+                else:
+                    canvas.delete("background")
+                    bg_photo_ref = None
         else:
             canvas.delete("background")
             bg_photo_ref = None
@@ -4208,6 +4320,7 @@ def main():
     root.after(100, reset_cursor_hide_timer)
     root.after(300, tick_status_pulse)
     root.after(400, tick_lyric_glow)
+    root.after(600, tick_ken_burns)
 
     start_recognition_thread()
 
