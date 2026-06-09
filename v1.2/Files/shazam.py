@@ -11,7 +11,9 @@ from PIL import Image, ImageTk, ImageFilter, ImageStat, ImageDraw, ImageFont
 import io
 import os
 import json
+import math
 import re
+import unicodedata
 from screeninfo import get_monitors
 import threading
 import logging
@@ -39,6 +41,7 @@ TEMP_IMAGE_FILENAME = 'image_temp.jpg'
 HISTORY_IMAGE_DIR = 'history_images'      # Relative name, base is APP_ROOT_DIR
 LAST_STATE_FILENAME = 'last_state.json'
 HISTORY_STATE_FILENAME = 'history_state.json'
+LYRICS_CACHE_FILENAME = 'lyrics_cache.json'
 SONG_HISTORY_FILENAME = 'song_history.log' # Relative name, base is APP_ROOT_DIR
 
 # Paths relative to the script's location (inside Files/)
@@ -47,6 +50,7 @@ IMAGE_PATH = SCRIPT_DIR / IMAGE_FILENAME
 TEMP_IMAGE_PATH = SCRIPT_DIR / TEMP_IMAGE_FILENAME # Keep temp file relative to script
 LAST_STATE_FILE_PATH = SCRIPT_DIR / LAST_STATE_FILENAME
 HISTORY_STATE_FILE_PATH = SCRIPT_DIR / HISTORY_STATE_FILENAME
+LYRICS_CACHE_FILE_PATH = SCRIPT_DIR / LYRICS_CACHE_FILENAME
 
 # Paths relative to the application root (one level up from script)
 HISTORY_IMAGE_DIR_PATH = APP_ROOT_DIR / HISTORY_IMAGE_DIR
@@ -63,10 +67,20 @@ title_label_id: Optional[int] = None
 album_label_id: Optional[int] = None
 artist_label_id: Optional[int] = None
 status_label_id: Optional[int] = None
+status_pill_bg_id: Optional[int] = None
+status_pill_dot_id: Optional[int] = None
+progress_bar_track_id: Optional[int] = None
+progress_bar_fill_id: Optional[int] = None
 lyrics_primary_label_id: Optional[int] = None
 lyrics_secondary_label_id: Optional[int] = None
 lyrics_tertiary_label_id: Optional[int] = None
 coverart_item_id: Optional[int] = None
+
+accent_color_hex: str = "#7c8fff"   # Cover-art derived accent; updated per track.
+ui_font_family_cache: Optional[str] = None
+status_pulse_phase: float = 0.0
+status_pulse_job_id: Optional[str] = None
+status_pill_layout: Dict[str, Any] = {}   # Cached args for re-rendering on text change
 
 bg_photo_ref: Optional[ImageTk.PhotoImage] = None
 square_photo_ref: Optional[ImageTk.PhotoImage] = None
@@ -88,14 +102,17 @@ recognition_thread_stop_event = threading.Event()
 
 logger = logging.getLogger("SongRecognizer")
 
+lyrics_cache: Dict[str, Any] = {}
+
 lyrics_state: Dict[str, Any] = {
     "track_key": None,
     "source": None,
     "synced_lines": [],
     "plain_lyrics": "",
     "display_lines": [],
-    "start_time_monotonic": None,
-    "start_offset_seconds": 0.0,
+    "anchor_monotonic": None,
+    "anchor_song_seconds": 0.0,
+    "lrc_offset_seconds": 0.0,
 }
 
 
@@ -131,7 +148,8 @@ def load_config() -> Dict[str, Any]:
             "history_font_size_ratio": 0.7, "history_min_side_width": 300,
             "layout_side_min_buffer": 50, "layout_below_min_buffer": 50,
             "status_font_size_ratio": 0.8, # Base ratio before halving
-            "history_max_items_retain": 20 # Max items to keep images for on disk
+            "history_max_items_retain": 20, # Max items to keep images for on disk
+            "vignette_intensity": 0.55,
         },
         "network": {"timeout": 7, "retry_count": 3, "retry_delay": 2},
         "lyrics": {
@@ -145,6 +163,12 @@ def load_config() -> Dict[str, Any]:
             "font_scale": 0.75,
             "width_ratio": 0.8,
             "offset_adjust_seconds": 0.0,
+            "anchor_smoothing_alpha": 0.35,
+            "enable_netease_fallback": True,
+            "netease_api_base": "https://music.xianqiao.wang/neteaseapiv2",
+            "cache_ttl_hours": 720,
+            "cache_miss_ttl_hours": 1,
+            "fetch_timeout_seconds": 15,
             "panel_gap_ratio": 0.04,
             "panel_margin_ratio": 0.05,
             "cinematic_history_max_items": 4,
@@ -271,8 +295,14 @@ def select_input_device(required_channels: int) -> Optional[int]:
         logger.error(f"No input device found with required channels ({required_channels}). Available devices logged previously.")
         return None
 
-def record_audio(record_seconds_override: Optional[float] = None) -> Optional[str]:
-    """Records audio for a configured duration to a temporary WAV file."""
+def record_audio(record_seconds_override: Optional[float] = None) -> Tuple[Optional[str], Optional[float]]:
+    """Records audio for a configured duration to a temporary WAV file.
+
+    Returns (wav_path, record_start_monotonic). record_start_monotonic is the
+    time.monotonic() value taken immediately before the first audio frame was
+    captured — used downstream to subtract recording + recognition latency from
+    the lyrics sync anchor.
+    """
     global current_status_message
     schedule_gui_update(set_status_message, "Listening...")
     audio_cfg = config['audio']
@@ -287,7 +317,7 @@ def record_audio(record_seconds_override: Optional[float] = None) -> Optional[st
     except AttributeError:
         logger.error(f"Invalid PyAudio format: {audio_cfg['format']}")
         schedule_gui_update(set_status_message, "Error: Invalid audio format")
-        return None
+        return None, None
 
     selected_device_index = dev_index
     if selected_device_index is None or not validate_device_channels(selected_device_index, chans):
@@ -298,12 +328,13 @@ def record_audio(record_seconds_override: Optional[float] = None) -> Optional[st
         selected_device_index = select_input_device(chans)
         if selected_device_index is None:
             schedule_gui_update(set_status_message, "Error: No suitable audio device")
-            return None
+            return None, None
         else:
             config['audio']['device_index'] = selected_device_index
 
     stream = None
     temp_wav_path: Optional[str] = None
+    record_start_monotonic: Optional[float] = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_f:
             temp_wav_path = temp_f.name
@@ -316,12 +347,13 @@ def record_audio(record_seconds_override: Optional[float] = None) -> Optional[st
         logger.info(f"Recording started on device {selected_device_index}...")
         frames = []
         num_chunks_to_record = int((samp_rate / chunk) * record_secs)
+        record_start_monotonic = time.monotonic()
         for i in range(num_chunks_to_record):
             if recognition_thread_stop_event.is_set():
                 logger.info("Recording stopped early by shutdown signal.")
                 schedule_gui_update(set_status_message, "Shutting down...")
                 safe_remove(temp_wav_path, "temp WAV on cancelled recording")
-                return None
+                return None, None
             try:
                 data = stream.read(chunk, exception_on_overflow=False)
                 frames.append(data)
@@ -332,23 +364,23 @@ def record_audio(record_seconds_override: Optional[float] = None) -> Optional[st
                     logger.error(f"IOError during stream read: {e}")
                     schedule_gui_update(set_status_message, "Error: Audio input failed")
                     safe_remove(temp_wav_path, "temp WAV on IO read error")
-                    return None
+                    return None, None
             except Exception as e:
                 logger.exception(f"Unexpected error reading audio stream: {e}")
                 schedule_gui_update(set_status_message, "Error: Audio read failed")
                 safe_remove(temp_wav_path, "temp WAV on unexpected read error")
-                return None
+                return None, None
         logger.info(f"Recording finished ({len(frames)} chunks captured).")
     except OSError as e:
         logger.error(f"OSError opening stream on device {selected_device_index}: {e}")
         schedule_gui_update(set_status_message, f"Error: Cannot open device {selected_device_index}")
         safe_remove(temp_wav_path, "temp WAV on stream open error")
-        return None
+        return None, None
     except Exception as e:
         logger.exception(f"Unexpected error during recording: {e}")
         schedule_gui_update(set_status_message, "Error: Recording failed")
         safe_remove(temp_wav_path, "temp WAV on unexpected setup error")
-        return None
+        return None, None
     finally:
         if stream:
             try:
@@ -374,17 +406,17 @@ def record_audio(record_seconds_override: Optional[float] = None) -> Optional[st
                  wave_file_obj.setframerate(samp_rate)
                  wave_file_obj.writeframes(b''.join(frames))
             logger.info(f"Audio saved successfully to: {temp_wav_path}")
-            return temp_wav_path
+            return temp_wav_path, record_start_monotonic
         except wave.Error as e:
             logger.error(f"Wave library error writing WAV file {temp_wav_path}: {e}")
             schedule_gui_update(set_status_message, "Error: Could not save audio")
             safe_remove(temp_wav_path, "temp WAV on wave write error")
-            return None
+            return None, None
         except Exception as e:
              logger.exception(f"Unexpected error writing WAV file: {e}")
              schedule_gui_update(set_status_message, "Error: Saving audio failed")
              safe_remove(temp_wav_path, "temp WAV on unexpected write error")
-             return None
+             return None, None
         finally:
             if audio_instance_for_size:
                 audio_instance_for_size.terminate()
@@ -394,7 +426,7 @@ def record_audio(record_seconds_override: Optional[float] = None) -> Optional[st
             logger.warning("No audio frames captured.")
             schedule_gui_update(set_status_message, "Error: No audio captured")
         safe_remove(temp_wav_path, "temp WAV when no frames recorded")
-        return None
+        return None, None
 
 
 # --- Song Recognition ---
@@ -499,6 +531,173 @@ def calculate_brightness(image: Image.Image) -> float:
     except Exception as e:
         logger.warning(f"Could not calculate brightness: {e}")
         return 0.5
+
+
+# --- Visual polish helpers (typography, accent color, vignette) ---
+
+UI_FONT_PREFERENCE = [
+    "Inter",
+    "SF Pro Text",
+    "Segoe UI Variable",
+    "Segoe UI",
+    "Roboto",
+    "Noto Sans",
+    "Helvetica Neue",
+    "Helvetica",
+    "Arial",
+]
+
+
+def get_ui_font_family() -> str:
+    """Returns the best-available UI font from a curated fallback chain.
+
+    Resolved once per process; falls back to Tk's default if nothing matches."""
+    global ui_font_family_cache
+    if ui_font_family_cache is not None:
+        return ui_font_family_cache
+    chosen = "Arial"
+    try:
+        available = {name.lower() for name in tkFont.families()}
+        for candidate in UI_FONT_PREFERENCE:
+            if candidate.lower() in available:
+                chosen = candidate
+                break
+    except tk.TclError:
+        pass
+    ui_font_family_cache = chosen
+    logger.info(f"UI font family: {chosen}")
+    return chosen
+
+
+def mix_rgb(rgb_a: Tuple[int, int, int], rgb_b: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
+    """Linear interpolate two RGB tuples. t=0 → a, t=1 → b."""
+    t = max(0.0, min(1.0, t))
+    return (
+        int(rgb_a[0] + (rgb_b[0] - rgb_a[0]) * t),
+        int(rgb_a[1] + (rgb_b[1] - rgb_a[1]) * t),
+        int(rgb_a[2] + (rgb_b[2] - rgb_a[2]) * t),
+    )
+
+
+def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(
+        max(0, min(255, int(rgb[0]))),
+        max(0, min(255, int(rgb[1]))),
+        max(0, min(255, int(rgb[2]))),
+    )
+
+
+def hex_to_rgb(value: str) -> Tuple[int, int, int]:
+    value = value.lstrip("#")
+    if len(value) == 3:
+        value = "".join(c * 2 for c in value)
+    try:
+        return (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
+    except ValueError:
+        return (124, 143, 255)
+
+
+def extract_accent_color(image: Image.Image) -> str:
+    """Picks a vibrant accent color from the cover art.
+
+    Quantizes to a small palette, then prefers colors with high
+    chroma (saturation × value). Falls back to a neutral indigo on
+    unusable images (monochrome, tiny, errors)."""
+    try:
+        thumb = image.convert("RGB").resize((96, 96), Image.Resampling.BILINEAR)
+        quant = thumb.quantize(colors=8, method=Image.Quantize.MEDIANCUT)
+        palette = quant.getpalette() or []
+        counts = sorted(quant.getcolors() or [], reverse=True)
+        best_score = -1.0
+        best_rgb = (124, 143, 255)
+        for count, idx in counts:
+            r = palette[idx * 3 + 0]
+            g = palette[idx * 3 + 1]
+            b = palette[idx * 3 + 2]
+            # Skip near-black and near-white (rarely make good accents).
+            mx = max(r, g, b); mn = min(r, g, b)
+            if mx < 40 or mn > 220:
+                continue
+            sat = (mx - mn) / mx if mx else 0
+            val = mx / 255.0
+            # Score: chroma weighted, mild popularity bias.
+            score = (sat * 0.7 + val * 0.3) * (count ** 0.3)
+            if score > best_score:
+                best_score = score
+                best_rgb = (r, g, b)
+        # Brighten low-luminance accents so they read on dark scrim.
+        r, g, b = best_rgb
+        mx = max(r, g, b)
+        if mx < 160:
+            scale = 180 / max(1, mx)
+            best_rgb = (min(255, int(r * scale)), min(255, int(g * scale)), min(255, int(b * scale)))
+        return rgb_to_hex(best_rgb)
+    except Exception as e:
+        logger.debug(f"Accent extraction failed: {e}")
+        return "#7c8fff"
+
+
+def apply_vignette(image: Image.Image, intensity: float = 0.55) -> Image.Image:
+    """Composites a radial darken vignette onto a blurred backdrop so foreground
+    text remains readable regardless of cover-art brightness. One PIL pass per
+    track change — not per frame."""
+    try:
+        w, h = image.size
+        if w < 4 or h < 4:
+            return image
+        # Build a radial gradient mask: bright at center, dark at corners.
+        mask = Image.new("L", (w, h), 0)
+        draw = ImageDraw.Draw(mask)
+        max_r = (w * w + h * h) ** 0.5 / 2
+        steps = 24
+        for i in range(steps, 0, -1):
+            t = i / steps
+            radius = max_r * t
+            shade = int(255 * (1.0 - t) * intensity)
+            cx, cy = w / 2, h / 2
+            draw.ellipse(
+                [cx - radius, cy - radius, cx + radius, cy + radius],
+                fill=shade,
+            )
+        mask = mask.filter(ImageFilter.GaussianBlur(max(8, min(w, h) // 18)))
+        dark = Image.new("RGB", (w, h), (0, 0, 0))
+        return Image.composite(dark, image, mask)
+    except Exception as e:
+        logger.debug(f"Vignette failed: {e}")
+        return image
+
+
+def draw_rounded_rect(canvas_obj: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
+                      radius: float, fill: str, outline: str = "", tags: Tuple[str, ...] = (),
+                      existing_id: Optional[int] = None) -> int:
+    """Draws a pill/rounded rectangle on a Tk canvas using polygon smoothing.
+
+    Tk canvas has no native rounded rect; smoothing a polygon with control
+    points hugging each corner gives a clean pill shape. Returns the item id."""
+    r = max(2, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
+    points = [
+        x1 + r, y1,
+        x2 - r, y1,
+        x2, y1,
+        x2, y1 + r,
+        x2, y2 - r,
+        x2, y2,
+        x2 - r, y2,
+        x1 + r, y2,
+        x1, y2,
+        x1, y2 - r,
+        x1, y1 + r,
+        x1, y1,
+    ]
+    if existing_id is not None:
+        try:
+            canvas_obj.coords(existing_id, *points)
+            canvas_obj.itemconfigure(existing_id, fill=fill, outline=outline)
+            return existing_id
+        except tk.TclError:
+            pass
+    return canvas_obj.create_polygon(points, fill=fill, outline=outline,
+                                     smooth=True, splinesteps=24, tags=tags)
 
 def create_placeholder_image(path: Path, width: int, height: int, text: str) -> bool:
     """Creates a simple placeholder image with text and saves it."""
@@ -922,12 +1121,14 @@ def fit_canvas_title_font(
     base_size: int,
     min_size: int,
     max_height: int,
-    family: str = "Arial",
+    family: Optional[str] = None,
     weight: str = "bold",
     slant: str = "roman",
     tags: Tuple[str, ...] = ("main_text",),
 ) -> Tuple[int, tkFont.Font, Tuple[int, int, int, int]]:
     """Shrinks the current-song title font until its wrapped height fits the allotted block."""
+    if family is None:
+        family = get_ui_font_family()
     font_size = max(min_size, base_size)
     item_id = text_item_id
     fallback_bbox = (int(x_pos), int(y_pos), int(x_pos + width), int(y_pos + max_height))
@@ -1001,16 +1202,20 @@ def extract_track_duration_seconds(track_info: Dict[str, Any]) -> Optional[float
 
 
 def extract_match_offset_seconds(result: Dict[str, Any]) -> float:
-    """Estimates current playback offset from the Shazam match payload."""
+    """Returns the song-position (seconds) corresponding to the start of the
+    captured audio sample, as reported by Shazam.
+
+    Note: this is *not* the current playback position. Callers must add the
+    elapsed wall-clock time between capture start and 'now' to estimate the
+    live song position.
+    """
     offset_seconds = 0.0
     matches = result.get("matches", [])
     if matches and isinstance(matches[0], dict):
         offset_value = safe_float(matches[0].get("offset"))
         if offset_value is not None:
             offset_seconds = max(0.0, offset_value)
-
-    offset_adjust = safe_float(config.get("lyrics", {}).get("offset_adjust_seconds")) or 0.0
-    return max(0.0, offset_seconds + offset_adjust)
+    return offset_seconds
 
 
 def parse_lrc_timestamp(timestamp: str) -> Optional[float]:
@@ -1021,6 +1226,22 @@ def parse_lrc_timestamp(timestamp: str) -> Optional[float]:
     minutes = int(match.group("minutes"))
     seconds = float(match.group("seconds"))
     return (minutes * 60) + seconds
+
+
+def parse_lrc_offset_tag(lrc_text: str) -> float:
+    """Extracts an LRC [offset:+ms] tag (milliseconds) as seconds.
+
+    Per LRC convention, a positive offset means lyrics should appear earlier
+    relative to the song clock; we return the value to *subtract* from the
+    playback position so that a positive tag pulls displayed lines forward.
+    """
+    match = re.search(r"\[offset:\s*([+-]?\d+)\s*\]", lrc_text, flags=re.IGNORECASE)
+    if not match:
+        return 0.0
+    try:
+        return int(match.group(1)) / 1000.0
+    except ValueError:
+        return 0.0
 
 
 def parse_synced_lyrics(lrc_text: str) -> List[Dict[str, Any]]:
@@ -1082,68 +1303,439 @@ def pick_best_lyrics_candidate(candidates: List[Dict[str, Any]], title: str, art
     return best_candidate
 
 
-def request_lrclib_candidate(title: str, artist: str, album: Optional[str], duration: Optional[float]) -> Optional[Dict[str, Any]]:
-    """Fetches lyrics metadata from LRCLIB using the most specific query first."""
-    timeout = config["network"]["timeout"]
-    headers = {"User-Agent": "SongPi/1.2"}
-    base_url = "https://lrclib.net/api"
-    prefer_synced = bool(config.get("lyrics", {}).get("prefer_synced_lyrics", True))
-    query_params = {
-        "track_name": title,
-        "artist_name": artist,
-    }
-    if album:
-        query_params["album_name"] = album
-    if duration:
-        query_params["duration"] = int(duration)
+_TITLE_SUFFIX_PATTERNS = [
+    r"\s*[-–—]\s*(?:remastered|remaster|re-?recorded|re-?master|radio edit|single version|album version|mono|stereo|deluxe|expanded|bonus track|live|acoustic|instrumental|extended mix|club mix|edit|version)\b.*$",
+    r"\s*\((?:feat\.?|featuring|ft\.?|with)\s[^)]*\)",
+    r"\s*\[(?:feat\.?|featuring|ft\.?|with)\s[^\]]*\]",
+    r"\s*\((?:official|lyric|lyrics|audio|video|music video|visualizer|hd|4k)[^)]*\)",
+    r"\s*\[(?:official|lyric|lyrics|audio|video|music video|visualizer|hd|4k)[^\]]*\]",
+    r"\s*\((?:from|from the)\s[^)]*\)",
+    r"\s*[-–—]\s*from\s+[\"“‘].*$",
+]
+_ARTIST_FEAT_PATTERN = re.compile(
+    r"\s*(?:feat\.?|featuring|ft\.?|with|,|&|x|×|\+|/)\s.*$",
+    flags=re.IGNORECASE,
+)
 
-    candidate = None
+
+def normalize_search_text(value: Optional[str]) -> str:
+    """Looser normalization for *search queries* (kept human-readable)."""
+    if not value:
+        return ""
+    # Unicode-fold accents and smart quotes.
+    folded = unicodedata.normalize("NFKD", value)
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    folded = folded.replace("‘", "'").replace("’", "'")
+    folded = folded.replace("“", '"').replace("”", '"')
+    folded = folded.replace("&", " and ")
+    folded = re.sub(r"\s+", " ", folded).strip()
+    return folded
+
+
+def clean_title_variants(title: str) -> List[str]:
+    """Returns title variants in order: original, deparenthesized, stripped-features-and-suffixes."""
+    variants: List[str] = []
+    base = normalize_search_text(title)
+    if base:
+        variants.append(base)
+
+    stripped = base
+    for pattern in _TITLE_SUFFIX_PATTERNS:
+        stripped = re.sub(pattern, "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\s+", " ", stripped).strip(" -–—:,")
+    if stripped and stripped != base:
+        variants.append(stripped)
+
+    bare = re.sub(r"[\(\[].*?[\)\]]", "", base)
+    bare = re.sub(r"\s+", " ", bare).strip(" -–—:,")
+    if bare and bare not in variants:
+        variants.append(bare)
+
+    return variants
+
+
+def clean_artist_variants(artist: str) -> List[str]:
+    """Returns artist variants: full, primary-only (strip feat/with/&)."""
+    variants: List[str] = []
+    base = normalize_search_text(artist)
+    if base:
+        variants.append(base)
+    primary = _ARTIST_FEAT_PATTERN.sub("", base).strip()
+    if primary and primary != base:
+        variants.append(primary)
+    return variants
+
+
+def cache_key(title: str, artist: str) -> str:
+    return build_track_key(title, artist)
+
+
+def load_lyrics_cache() -> Dict[str, Any]:
+    if not LYRICS_CACHE_FILE_PATH.is_file():
+        return {}
     try:
-        response = requests.get(f"{base_url}/get", params=query_params, headers=headers, timeout=timeout)
-        if response.ok:
-            payload = response.json()
-            if isinstance(payload, dict):
-                candidate = payload
-        else:
-            logger.info(f"LRCLIB exact lookup returned {response.status_code} for '{title}' by '{artist}'.")
-    except requests.RequestException as e:
-        logger.warning(f"LRCLIB exact lookup failed for '{title}' by '{artist}': {e}")
-    except ValueError as e:
-        logger.warning(f"LRCLIB exact lookup returned invalid JSON: {e}")
+        with open(LYRICS_CACHE_FILE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"Could not load lyrics cache: {e}")
+    return {}
 
-    if candidate and (candidate.get("syncedLyrics") or not prefer_synced):
-        return candidate
 
+def save_lyrics_cache() -> None:
     try:
-        response = requests.get(
-            f"{base_url}/search",
-            params={"track_name": title, "artist_name": artist},
-            headers=headers,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, list):
-            return pick_best_lyrics_candidate(payload, title, artist)
-        if isinstance(payload, dict):
-            return payload
-    except requests.RequestException as e:
-        logger.warning(f"LRCLIB search failed for '{title}' by '{artist}': {e}")
-    except ValueError as e:
-        logger.warning(f"LRCLIB search returned invalid JSON: {e}")
+        with open(LYRICS_CACHE_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(lyrics_cache, f, ensure_ascii=False)
+    except OSError as e:
+        logger.warning(f"Could not save lyrics cache: {e}")
 
+
+def cache_lookup(title: str, artist: str) -> Optional[Dict[str, Any]]:
+    cache_cfg = config.get("lyrics", {})
+    ttl_hit = max(0, int(safe_float(cache_cfg.get("cache_ttl_hours")) or 720))   # 30d
+    ttl_miss = max(0, int(safe_float(cache_cfg.get("cache_miss_ttl_hours")) or 24))
+    entry = lyrics_cache.get(cache_key(title, artist))
+    if not isinstance(entry, dict):
+        return None
+    fetched_at = safe_float(entry.get("fetched_at")) or 0.0
+    age_hours = (time.time() - fetched_at) / 3600.0
+    is_miss = not (entry.get("syncedLyrics") or entry.get("plainLyrics"))
+    ttl = ttl_miss if is_miss else ttl_hit
+    if ttl and age_hours > ttl:
+        return None
+    return entry
+
+
+def cache_store(title: str, artist: str, candidate: Optional[Dict[str, Any]]) -> None:
+    payload = dict(candidate) if candidate else {}
+    payload["fetched_at"] = time.time()
+    lyrics_cache[cache_key(title, artist)] = payload
+    save_lyrics_cache()
+
+
+def is_acceptable_candidate(candidate: Optional[Dict[str, Any]], prefer_synced: bool) -> bool:
+    if not candidate:
+        return False
+    if candidate.get("syncedLyrics"):
+        return True
+    if not prefer_synced and candidate.get("plainLyrics"):
+        return True
+    return False
+
+
+def _lyrics_http_get(url: str, params: Dict[str, Any], headers: Dict[str, str],
+                     timeout: int, attempts: int = 2) -> Optional[requests.Response]:
+    """HTTP GET with one retry on timeout / connection error. Lyric APIs are
+    slow on cold TLS handshakes, so we don't want a single timeout to nuke
+    the whole fetch ladder."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return requests.get(url, params=params, headers=headers, timeout=timeout)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+            logger.debug(f"Lyric HTTP {url} attempt {attempt + 1} timed out: {e}")
+            continue
+        except requests.RequestException as e:
+            logger.debug(f"Lyric HTTP {url} failed: {e}")
+            return None
+    if last_exc is not None:
+        logger.debug(f"Lyric HTTP {url} exhausted retries: {last_exc}")
     return None
 
 
-def set_lyrics_state(track_key: str, synced_lines: List[Dict[str, Any]], plain_lyrics: str, start_offset_seconds: float, source: Optional[str]) -> None:
-    """Stores current lyrics state for the active song."""
+def lrclib_get(title: str, artist: str, album: Optional[str], duration: Optional[float],
+               timeout: int, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    params: Dict[str, Any] = {"track_name": title, "artist_name": artist}
+    if album:
+        params["album_name"] = album
+    if duration:
+        params["duration"] = int(duration)
+    response = _lyrics_http_get("https://lrclib.net/api/get", params, headers, timeout)
+    if response is None or not response.ok:
+        return None
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            return payload
+    except ValueError as e:
+        logger.debug(f"LRCLIB /get bad JSON: {e}")
+    return None
+
+
+def lrclib_search(title: str, artist: str, timeout: int, headers: Dict[str, str],
+                  duration: Optional[float] = None) -> List[Dict[str, Any]]:
+    params: Dict[str, Any] = {"track_name": title, "artist_name": artist}
+    response = _lyrics_http_get("https://lrclib.net/api/search", params, headers, timeout)
+    if response is None or not response.ok:
+        # Try the looser `q=` parameter as a fallback — LRCLIB sometimes
+        # returns better hits for messy titles via free-text search.
+        response = _lyrics_http_get(
+            "https://lrclib.net/api/search",
+            {"q": f"{title} {artist}".strip()},
+            headers,
+            timeout,
+        )
+    if response is None or not response.ok:
+        return []
+    try:
+        payload = response.json()
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            return [payload]
+    except ValueError as e:
+        logger.debug(f"LRCLIB /search bad JSON: {e}")
+    return []
+
+
+def score_lrclib_candidate(candidate: Dict[str, Any], title: str, artist: str,
+                           duration: Optional[float]) -> int:
+    norm_title = normalize_lyrics_key_part(title)
+    norm_artist = normalize_lyrics_key_part(artist)
+    cand_title = normalize_lyrics_key_part(
+        candidate.get("trackName") or candidate.get("name") or candidate.get("title")
+    )
+    cand_artist = normalize_lyrics_key_part(
+        candidate.get("artistName") or candidate.get("artist") or candidate.get("artist_name")
+    )
+    score = 0
+    if cand_title == norm_title:
+        score += 6
+    elif norm_title and norm_title in cand_title:
+        score += 3
+    elif cand_title and cand_title in norm_title:
+        score += 2
+
+    if cand_artist == norm_artist:
+        score += 6
+    elif norm_artist and norm_artist in cand_artist:
+        score += 3
+    elif cand_artist and cand_artist in norm_artist:
+        score += 2
+
+    if candidate.get("syncedLyrics"):
+        score += 5
+    elif candidate.get("plainLyrics"):
+        score += 1
+
+    cand_duration = safe_float(candidate.get("duration"))
+    if duration and cand_duration:
+        diff = abs(cand_duration - duration)
+        if diff <= 2:
+            score += 4
+        elif diff <= 5:
+            score += 2
+        elif diff > 15:
+            score -= 3
+    return score
+
+
+def pick_best_scored_candidate(candidates: List[Dict[str, Any]], title: str, artist: str,
+                               duration: Optional[float]) -> Optional[Dict[str, Any]]:
+    best = None
+    best_score = -1
+    for cand in candidates:
+        if not isinstance(cand, dict):
+            continue
+        s = score_lrclib_candidate(cand, title, artist, duration)
+        if s > best_score:
+            best_score = s
+            best = cand
+    return best
+
+
+def netease_fallback(title: str, artist: str, timeout: int, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """Searches NetEase Cloud Music (public unofficial endpoints) as a secondary
+    timed-lyric source. Tries the community-mirror search → lyric API.
+    Returns a candidate shaped like the LRCLIB payload so the rest of the pipeline
+    is unchanged."""
+    base = config.get("lyrics", {}).get("netease_api_base", "https://music.xianqiao.wang/neteaseapiv2")
+    base = base.rstrip("/")
+    keywords = f"{title} {artist}".strip()
+    try:
+        search_resp = requests.get(
+            f"{base}/search",
+            params={"keywords": keywords, "limit": 10, "type": 1},
+            headers=headers,
+            timeout=timeout,
+        )
+        search_resp.raise_for_status()
+        search_payload = search_resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logger.debug(f"NetEase search failed for '{title}'/'{artist}': {e}")
+        return None
+
+    songs = (
+        search_payload.get("result", {}).get("songs")
+        if isinstance(search_payload, dict)
+        else None
+    ) or []
+    if not isinstance(songs, list) or not songs:
+        return None
+
+    norm_title = normalize_lyrics_key_part(title)
+    norm_artist = normalize_lyrics_key_part(artist)
+    best_song = None
+    best_score = -1
+    for song in songs:
+        if not isinstance(song, dict):
+            continue
+        sname = normalize_lyrics_key_part(song.get("name"))
+        artists = song.get("artists") or song.get("ar") or []
+        anames = " ".join(
+            normalize_lyrics_key_part(a.get("name")) for a in artists if isinstance(a, dict)
+        )
+        s = 0
+        if sname == norm_title:
+            s += 6
+        elif norm_title and norm_title in sname:
+            s += 3
+        if norm_artist and norm_artist in anames:
+            s += 4
+        if s > best_score:
+            best_score = s
+            best_song = song
+
+    if not best_song or best_score < 4:
+        return None
+
+    song_id = best_song.get("id")
+    if not song_id:
+        return None
+
+    try:
+        lyric_resp = requests.get(
+            f"{base}/lyric",
+            params={"id": song_id},
+            headers=headers,
+            timeout=timeout,
+        )
+        lyric_resp.raise_for_status()
+        lyric_payload = lyric_resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logger.debug(f"NetEase lyric fetch failed for id={song_id}: {e}")
+        return None
+
+    if not isinstance(lyric_payload, dict):
+        return None
+    lrc = (lyric_payload.get("lrc") or {}).get("lyric") or ""
+    if not lrc.strip():
+        return None
+
+    # Quick check: LRC must contain at least one timestamp tag to count as synced.
+    if not re.search(r"\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]", lrc):
+        return None
+
+    artists = best_song.get("artists") or best_song.get("ar") or []
+    artist_name = ", ".join(a.get("name", "") for a in artists if isinstance(a, dict)).strip(", ")
+    return {
+        "trackName": best_song.get("name"),
+        "artistName": artist_name or artist,
+        "syncedLyrics": lrc,
+        "plainLyrics": "",
+        "duration": (best_song.get("duration") or 0) / 1000.0 or None,
+        "source": "netease",
+    }
+
+
+def request_lrclib_candidate(title: str, artist: str, album: Optional[str], duration: Optional[float]) -> Optional[Dict[str, Any]]:
+    """Multi-strategy lyric fetch: cache → LRCLIB search across variants → NetEase fallback.
+
+    We lead with /search rather than /get because /search is fuzzy, returns
+    multiple ranked candidates we can score, and tolerates Shazam metadata
+    quirks (punctuation, feat. tags, mismatched album/duration)."""
+    lyrics_cfg = config.get("lyrics", {})
+    base_timeout = config["network"]["timeout"]
+    fetch_timeout = max(base_timeout, int(safe_float(lyrics_cfg.get("fetch_timeout_seconds")) or 15))
+    headers = {"User-Agent": "SongPi/1.2 (https://github.com/kyol-dony/SongPi)"}
+    prefer_synced = bool(lyrics_cfg.get("prefer_synced_lyrics", True))
+    enable_netease = bool(lyrics_cfg.get("enable_netease_fallback", True))
+
+    cached = cache_lookup(title, artist)
+    if cached is not None:
+        if is_acceptable_candidate(cached, prefer_synced):
+            logger.debug(f"Lyrics cache hit for '{title}' by '{artist}'.")
+            return cached
+        if not cached.get("syncedLyrics") and not cached.get("plainLyrics"):
+            logger.debug(f"Lyrics cache: previous miss still fresh for '{title}' by '{artist}'.")
+            return None
+
+    title_variants = clean_title_variants(title) or [title]
+    artist_variants = clean_artist_variants(artist) or [artist]
+    album_clean = normalize_search_text(album) if album else None
+
+    best_candidate: Optional[Dict[str, Any]] = None
+
+    def consider(cand: Optional[Dict[str, Any]]):
+        nonlocal best_candidate
+        if not cand:
+            return
+        if best_candidate is None:
+            best_candidate = cand
+            return
+        new_score = score_lrclib_candidate(cand, title, artist, duration)
+        cur_score = score_lrclib_candidate(best_candidate, title, artist, duration)
+        if new_score > cur_score:
+            best_candidate = cand
+
+    # Step 1: a single tight /get attempt with full metadata — if it lands we
+    # save ~one round-trip. Skip if no album/duration to avoid a guaranteed 404.
+    if album_clean and duration:
+        consider(lrclib_get(title_variants[0], artist_variants[0], album_clean, duration, fetch_timeout, headers))
+
+    # Step 2: /search across (title × artist) variants, then score everything.
+    if not is_acceptable_candidate(best_candidate, prefer_synced):
+        seen_keys = set()
+        all_search_results: List[Dict[str, Any]] = []
+        for t in title_variants:
+            for a in artist_variants:
+                key = (t.lower(), a.lower())
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                results = lrclib_search(t, a, fetch_timeout, headers, duration)
+                all_search_results.extend(results)
+                if len(all_search_results) >= 30:
+                    break
+            if len(all_search_results) >= 30:
+                break
+        scored = pick_best_scored_candidate(all_search_results, title, artist, duration)
+        consider(scored)
+
+    # Step 3: NetEase fallback for tracks LRCLIB doesn't carry.
+    if enable_netease and not is_acceptable_candidate(best_candidate, prefer_synced):
+        netease_cand = netease_fallback(title_variants[0], artist_variants[0], fetch_timeout, headers)
+        consider(netease_cand)
+
+    cache_store(title, artist, best_candidate)
+    return best_candidate
+
+
+def set_lyrics_state(
+    track_key: str,
+    synced_lines: List[Dict[str, Any]],
+    plain_lyrics: str,
+    anchor_song_seconds: float,
+    anchor_monotonic: float,
+    lrc_offset_seconds: float,
+    source: Optional[str],
+) -> None:
+    """Stores current lyrics state for the active song.
+
+    `anchor_song_seconds` is the song-position (s) at `anchor_monotonic`
+    (a time.monotonic() value). Live position = anchor_song_seconds +
+    (time.monotonic() - anchor_monotonic) - lrc_offset_seconds + user_adjust.
+    """
     lyrics_state["track_key"] = track_key
     lyrics_state["source"] = source
     lyrics_state["synced_lines"] = synced_lines
     lyrics_state["plain_lyrics"] = plain_lyrics.strip()
     lyrics_state["display_lines"] = []
-    lyrics_state["start_time_monotonic"] = time.monotonic()
-    lyrics_state["start_offset_seconds"] = start_offset_seconds
+    lyrics_state["anchor_monotonic"] = anchor_monotonic
+    lyrics_state["anchor_song_seconds"] = anchor_song_seconds
+    lyrics_state["lrc_offset_seconds"] = lrc_offset_seconds
 
 
 def clear_lyrics_state() -> None:
@@ -1153,8 +1745,36 @@ def clear_lyrics_state() -> None:
     lyrics_state["synced_lines"] = []
     lyrics_state["plain_lyrics"] = ""
     lyrics_state["display_lines"] = []
-    lyrics_state["start_time_monotonic"] = None
-    lyrics_state["start_offset_seconds"] = 0.0
+    lyrics_state["anchor_monotonic"] = None
+    lyrics_state["anchor_song_seconds"] = 0.0
+    lyrics_state["lrc_offset_seconds"] = 0.0
+
+
+def refine_lyrics_anchor(candidate_song_seconds: float, candidate_monotonic: float) -> None:
+    """Blends a new recognition's anchor into the existing one for the same
+    track using an exponential moving average. Keeps lyrics from snapping
+    backwards on every cycle while still correcting drift."""
+    existing_anchor_monotonic = lyrics_state.get("anchor_monotonic")
+    existing_anchor_song = lyrics_state.get("anchor_song_seconds", 0.0)
+    if existing_anchor_monotonic is None:
+        lyrics_state["anchor_monotonic"] = candidate_monotonic
+        lyrics_state["anchor_song_seconds"] = candidate_song_seconds
+        return
+
+    expected_at_candidate = existing_anchor_song + (candidate_monotonic - existing_anchor_monotonic)
+    delta = candidate_song_seconds - expected_at_candidate
+
+    # Sanity: ignore wild outliers (likely Shazam mis-match), hard reset on big shifts (track change missed).
+    if abs(delta) > 30.0:
+        lyrics_state["anchor_monotonic"] = candidate_monotonic
+        lyrics_state["anchor_song_seconds"] = candidate_song_seconds
+        return
+    if abs(delta) < 0.2:
+        return
+
+    alpha = safe_float(config.get("lyrics", {}).get("anchor_smoothing_alpha")) or 0.35
+    alpha = min(1.0, max(0.05, alpha))
+    lyrics_state["anchor_song_seconds"] = existing_anchor_song + delta * alpha
 
 
 def extract_album_name(track_info: Dict[str, Any]) -> Optional[str]:
@@ -1176,8 +1796,20 @@ def extract_album_name(track_info: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def prepare_lyrics_for_track(result: Dict[str, Any], title: str, artist: str) -> None:
-    """Fetches LRCLIB lyrics for a newly recognized track and seeds the sync timer."""
+def prepare_lyrics_for_track(
+    result: Dict[str, Any],
+    title: str,
+    artist: str,
+    record_start_monotonic: Optional[float] = None,
+) -> None:
+    """Fetches LRCLIB lyrics for a newly recognized track and seeds (or refines)
+    the sync anchor.
+
+    `record_start_monotonic` is the time.monotonic() at the moment audio
+    capture began. The Shazam offset is the song-position at that moment, so
+    using it as our anchor automatically subtracts recording + recognition +
+    LRCLIB-fetch latency from the live playback estimate.
+    """
     if not config.get("lyrics", {}).get("enabled", True):
         clear_lyrics_state()
         return
@@ -1185,8 +1817,12 @@ def prepare_lyrics_for_track(result: Dict[str, Any], title: str, artist: str) ->
     track_info = result.get("track", {})
     album_name = extract_album_name(track_info)
     duration_seconds = extract_track_duration_seconds(track_info)
-    start_offset_seconds = extract_match_offset_seconds(result)
+    shazam_offset_seconds = extract_match_offset_seconds(result)
     track_key = build_track_key(title, artist)
+
+    # Anchor at the moment audio capture began. Fall back to "now" only if the
+    # caller didn't thread the timestamp (e.g. legacy callsite).
+    anchor_monotonic = record_start_monotonic if record_start_monotonic is not None else time.monotonic()
 
     lyrics_candidate = request_lrclib_candidate(title, artist, album_name, duration_seconds)
     if not lyrics_candidate:
@@ -1197,6 +1833,7 @@ def prepare_lyrics_for_track(result: Dict[str, Any], title: str, artist: str) ->
     synced_text = lyrics_candidate.get("syncedLyrics") or ""
     plain_text = lyrics_candidate.get("plainLyrics") or ""
     synced_lines = parse_synced_lyrics(synced_text) if synced_text else []
+    lrc_offset_seconds = parse_lrc_offset_tag(synced_text) if synced_text else 0.0
     prefer_synced = bool(config.get("lyrics", {}).get("prefer_synced_lyrics", True))
     allow_plain = bool(config.get("lyrics", {}).get("show_plain_lyrics", False))
 
@@ -1210,11 +1847,40 @@ def prepare_lyrics_for_track(result: Dict[str, Any], title: str, artist: str) ->
         clear_lyrics_state()
         return
 
+    # Same track as currently loaded? Refine the anchor instead of resetting it
+    # so the displayed lyric position doesn't jitter on every recognition cycle.
+    same_track = (
+        lyrics_state.get("track_key") == track_key
+        and lyrics_state.get("anchor_monotonic") is not None
+        and synced_lines
+    )
+
+    if same_track:
+        logger.info(
+            f"Refining lyrics anchor for '{title}' by '{artist}' "
+            f"(shazam_offset={shazam_offset_seconds:.2f}s)."
+        )
+        lyrics_state["synced_lines"] = synced_lines
+        lyrics_state["plain_lyrics"] = plain_text.strip()
+        lyrics_state["lrc_offset_seconds"] = lrc_offset_seconds
+        lyrics_state["source"] = "LRCLIB"
+        refine_lyrics_anchor(shazam_offset_seconds, anchor_monotonic)
+        return
+
     logger.info(
         f"Lyrics loaded for '{title}' by '{artist}' "
-        f"(synced_lines={len(synced_lines)}, plain={bool(plain_text.strip())})."
+        f"(synced_lines={len(synced_lines)}, plain={bool(plain_text.strip())}, "
+        f"shazam_offset={shazam_offset_seconds:.2f}s, lrc_offset={lrc_offset_seconds:.2f}s)."
     )
-    set_lyrics_state(track_key, synced_lines, plain_text, start_offset_seconds, "LRCLIB")
+    set_lyrics_state(
+        track_key,
+        synced_lines,
+        plain_text,
+        shazam_offset_seconds,
+        anchor_monotonic,
+        lrc_offset_seconds,
+        "LRCLIB",
+    )
 
 
 def build_synced_lyrics_lines(playback_seconds: float) -> List[str]:
@@ -1242,11 +1908,19 @@ def build_synced_lyrics_lines(playback_seconds: float) -> List[str]:
 def compute_current_lyrics_lines() -> List[str]:
     """Calculates the currently visible lyric lines."""
     if lyrics_state.get("synced_lines"):
-        start_time = lyrics_state.get("start_time_monotonic")
-        if start_time is None:
+        anchor_monotonic = lyrics_state.get("anchor_monotonic")
+        if anchor_monotonic is None:
             return []
-        playback_seconds = lyrics_state.get("start_offset_seconds", 0.0) + (time.monotonic() - start_time)
-        return build_synced_lyrics_lines(playback_seconds)
+        anchor_song_seconds = lyrics_state.get("anchor_song_seconds", 0.0)
+        lrc_offset = lyrics_state.get("lrc_offset_seconds", 0.0)
+        user_adjust = safe_float(config.get("lyrics", {}).get("offset_adjust_seconds")) or 0.0
+        playback_seconds = (
+            anchor_song_seconds
+            + (time.monotonic() - anchor_monotonic)
+            - lrc_offset
+            + user_adjust
+        )
+        return build_synced_lyrics_lines(max(0.0, playback_seconds))
 
     if config.get("lyrics", {}).get("show_plain_lyrics", True):
         plain_lines = [line.strip() for line in lyrics_state.get("plain_lyrics", "").splitlines() if line.strip()]
@@ -1262,7 +1936,10 @@ def update_lyrics_display_text():
 
 
 def render_lyrics_labels():
-    """Renders synced lyric labels using measured text height so wrapped lines do not overlap."""
+    """Renders synced lyric labels with an emphasis hierarchy: the active line is
+    tinted with the cover-art accent color and rendered larger and brighter; the
+    next and following lines are dimmed and smaller so the eye locks onto the
+    current line first."""
     global lyrics_primary_label_id, lyrics_secondary_label_id, lyrics_tertiary_label_id
     if not canvas or not lyrics_layout_cache:
         return
@@ -1279,27 +1956,35 @@ def render_lyrics_labels():
         lyrics_secondary_label_id,
         lyrics_tertiary_label_id,
     ]
+    primary_fill = lyrics_layout_cache.get("primary_fill", "#ffffff")
+    # Blend accent toward white so it stays high-contrast against the vignette.
+    accent_rgb = hex_to_rgb(accent_color_hex)
+    active_rgb = mix_rgb(accent_rgb, (255, 255, 255), 0.35)
+    active_fill = rgb_to_hex(active_rgb)
     label_configs = [
         {
             "base_size": int(lyrics_layout_cache.get("primary_font_size", 24)),
             "min_size": int(lyrics_layout_cache.get("primary_min_font_size", 18)),
             "max_height": int(lyrics_layout_cache.get("primary_max_height", 80)),
             "gap_after": int(lyrics_layout_cache.get("primary_gap_after", 18)),
-            "fill": lyrics_layout_cache.get("primary_fill", "white"),
+            "fill": active_fill,
+            "weight": "bold",
         },
         {
             "base_size": int(lyrics_layout_cache.get("secondary_font_size", 18)),
             "min_size": int(lyrics_layout_cache.get("secondary_min_font_size", 14)),
             "max_height": int(lyrics_layout_cache.get("secondary_max_height", 50)),
             "gap_after": int(lyrics_layout_cache.get("secondary_gap_after", 12)),
-            "fill": lyrics_layout_cache.get("secondary_fill", "#c7c7c7"),
+            "fill": "#a9b0bd",   # ~62% white on dark scrim
+            "weight": "normal",
         },
         {
             "base_size": int(lyrics_layout_cache.get("tertiary_font_size", 16)),
             "min_size": int(lyrics_layout_cache.get("tertiary_min_font_size", 12)),
             "max_height": int(lyrics_layout_cache.get("tertiary_max_height", 44)),
             "gap_after": 0,
-            "fill": lyrics_layout_cache.get("tertiary_fill", "#8a8a8a"),
+            "fill": "#6b7280",   # ~38% white
+            "weight": "normal",
         },
     ]
 
@@ -1327,14 +2012,14 @@ def render_lyrics_labels():
                 cfg["base_size"],
                 cfg["min_size"],
                 cfg["max_height"],
-                family="Arial",
-                weight="bold",
+                family=get_ui_font_family(),
+                weight=cfg.get("weight", "bold"),
                 slant="roman",
                 tags=("main_text", "lyrics_text"),
             )
             previous_bottom = bbox[3]
         else:
-            empty_font = ("Arial", cfg["base_size"], "bold")
+            empty_font = (get_ui_font_family(), cfg["base_size"], cfg.get("weight", "bold"))
             if label_id:
                 canvas.coords(label_id, x_pos, current_y)
                 canvas.itemconfigure(
@@ -1367,6 +2052,209 @@ def render_lyrics_labels():
     canvas.tag_raise("main_text")
 
 
+def render_status_pill(text_x: float, text_y: float, anchor: str, font_size: int) -> None:
+    """Draws the status row as a rounded pill (dot + label).
+
+    Dot color = accent (when actively working) or neutral grey (idle). The dot
+    has a separate pulse animation driven by tick_status_pulse()."""
+    global status_label_id, status_pill_bg_id, status_pill_dot_id, status_pill_layout
+    if not canvas:
+        return
+
+    status_pill_layout = {
+        "text_x": text_x, "text_y": text_y, "anchor": anchor, "font_size": font_size,
+    }
+    label_text = current_status_message or ""
+    font_obj = (get_ui_font_family(), max(9, int(font_size * 0.95)), "bold")
+
+    # Sizing — keep it tight: text + dot + horizontal padding.
+    pad_x = max(10, int(font_size * 1.0))
+    pad_y = max(5, int(font_size * 0.5))
+    dot_radius = max(3, int(font_size * 0.32))
+    dot_gap = max(6, int(font_size * 0.6))
+
+    # Measure label.
+    try:
+        tk_font = tkFont.Font(family=get_ui_font_family(), size=max(9, int(font_size * 0.95)), weight="bold")
+        text_width = tk_font.measure(label_text) if label_text else 0
+        text_height = tk_font.metrics("linespace")
+    except tk.TclError:
+        text_width = max(40, len(label_text) * max(6, int(font_size * 0.55)))
+        text_height = font_size + 4
+
+    pill_w = pad_x * 2 + (dot_radius * 2) + dot_gap + text_width
+    pill_h = max(text_height + pad_y * 2, dot_radius * 2 + pad_y * 2)
+    if anchor == tk.W:
+        x1 = text_x
+        x2 = text_x + pill_w
+    elif anchor == tk.E:
+        x1 = text_x - pill_w
+        x2 = text_x
+    else:  # CENTER and others
+        x1 = text_x - pill_w / 2
+        x2 = text_x + pill_w / 2
+    y1 = text_y
+    y2 = text_y + pill_h
+
+    # Pill background: dark, slight translucency-look via mixed dark grey.
+    pill_fill = "#16181d"
+    status_pill_bg_id = draw_rounded_rect(
+        canvas, x1, y1, x2, y2,
+        radius=pill_h / 2,
+        fill=pill_fill,
+        outline="",
+        tags=("main_text", "status_pill"),
+        existing_id=status_pill_bg_id,
+    )
+
+    # Dot — accent color when "working", muted grey when idle.
+    msg_lower = label_text.lower()
+    working = any(k in msg_lower for k in ("listen", "recogni", "retry", "loading", "fetch"))
+    dot_color = accent_color_hex if working else "#5b6270"
+    dot_cx = x1 + pad_x + dot_radius
+    dot_cy = (y1 + y2) / 2
+    if status_pill_dot_id:
+        try:
+            canvas.coords(status_pill_dot_id,
+                          dot_cx - dot_radius, dot_cy - dot_radius,
+                          dot_cx + dot_radius, dot_cy + dot_radius)
+            canvas.itemconfigure(status_pill_dot_id, fill=dot_color, outline="")
+        except tk.TclError:
+            status_pill_dot_id = None
+    if not status_pill_dot_id:
+        status_pill_dot_id = canvas.create_oval(
+            dot_cx - dot_radius, dot_cy - dot_radius,
+            dot_cx + dot_radius, dot_cy + dot_radius,
+            fill=dot_color, outline="", tags=("main_text", "status_pill"),
+        )
+
+    # Label text.
+    text_anchor = tk.W
+    text_pos_x = dot_cx + dot_radius + dot_gap
+    text_pos_y = dot_cy
+    if status_label_id:
+        try:
+            canvas.coords(status_label_id, text_pos_x, text_pos_y)
+            canvas.itemconfigure(
+                status_label_id,
+                text=label_text,
+                font=font_obj,
+                fill="#e6e8ee",
+                anchor=text_anchor,
+            )
+        except tk.TclError:
+            status_label_id = None
+    if not status_label_id:
+        status_label_id = canvas.create_text(
+            text_pos_x, text_pos_y,
+            text=label_text,
+            font=font_obj,
+            fill="#e6e8ee",
+            anchor=text_anchor,
+            tags=("main_text", "status_pill"),
+        )
+
+
+def tick_status_pulse():
+    """Drives the breathing-dot animation on the status pill.
+
+    Cheap: only mutates one canvas oval's fill color on a sin curve; runs on a
+    ~250ms cadence so it stays gentle on a Pi."""
+    global status_pulse_job_id, status_pulse_phase
+    status_pulse_job_id = None
+    if not root or not canvas or not root.winfo_exists():
+        return
+    try:
+        if status_pill_dot_id:
+            msg_lower = (current_status_message or "").lower()
+            working = any(k in msg_lower for k in ("listen", "recogni", "retry", "loading", "fetch"))
+            if working:
+                status_pulse_phase = (status_pulse_phase + 0.25) % (2 * math.pi)
+                pulse = 0.5 + 0.5 * math.sin(status_pulse_phase)  # 0..1
+                accent_rgb = hex_to_rgb(accent_color_hex)
+                dim_rgb = mix_rgb(accent_rgb, (20, 22, 28), 0.55)
+                rgb = mix_rgb(dim_rgb, accent_rgb, pulse)
+                canvas.itemconfigure(status_pill_dot_id, fill=rgb_to_hex(rgb))
+            else:
+                canvas.itemconfigure(status_pill_dot_id, fill="#5b6270")
+    except tk.TclError:
+        pass
+
+    try:
+        status_pulse_job_id = root.after(220, tick_status_pulse)
+    except tk.TclError:
+        status_pulse_job_id = None
+
+
+def render_progress_bar(window_width: int, window_height: int) -> None:
+    """Draws a slim accent-tinted progress bar at the bottom of the canvas,
+    reflecting the current song playback position from the sync anchor."""
+    global progress_bar_track_id, progress_bar_fill_id
+    if not canvas:
+        return
+    bar_height = 3
+    margin = max(16, int(min(window_width, window_height) * 0.02))
+    y = window_height - margin
+    x1 = margin
+    x2 = window_width - margin
+
+    # Track (dim).
+    if progress_bar_track_id:
+        try:
+            canvas.coords(progress_bar_track_id, x1, y, x2, y + bar_height)
+            canvas.itemconfigure(progress_bar_track_id, fill="#2a2d35", outline="")
+        except tk.TclError:
+            progress_bar_track_id = None
+    if not progress_bar_track_id:
+        progress_bar_track_id = canvas.create_rectangle(
+            x1, y, x2, y + bar_height,
+            fill="#2a2d35", outline="",
+            tags=("main_text", "progress_bar"),
+        )
+
+    # Fill (accent), width updated each tick by tick_progress_bar.
+    if progress_bar_fill_id:
+        try:
+            canvas.coords(progress_bar_fill_id, x1, y, x1, y + bar_height)
+            canvas.itemconfigure(progress_bar_fill_id, fill=accent_color_hex, outline="")
+        except tk.TclError:
+            progress_bar_fill_id = None
+    if not progress_bar_fill_id:
+        progress_bar_fill_id = canvas.create_rectangle(
+            x1, y, x1, y + bar_height,
+            fill=accent_color_hex, outline="",
+            tags=("main_text", "progress_bar"),
+        )
+
+    tick_progress_bar()
+
+
+def tick_progress_bar() -> None:
+    """Updates the progress bar fill width based on the current lyrics anchor.
+    Called from render_progress_bar (initial draw) and from refresh_lyrics_display."""
+    if not canvas or not progress_bar_fill_id or not progress_bar_track_id:
+        return
+    try:
+        track_coords = canvas.coords(progress_bar_track_id)
+        if len(track_coords) < 4:
+            return
+        x1, y1, x2, y2 = track_coords
+        synced_lines = lyrics_state.get("synced_lines") or []
+        anchor_monotonic = lyrics_state.get("anchor_monotonic")
+        anchor_song_seconds = lyrics_state.get("anchor_song_seconds", 0.0)
+        if not synced_lines or anchor_monotonic is None:
+            canvas.coords(progress_bar_fill_id, x1, y1, x1, y2)
+            return
+        # Use last synced timestamp as effective track length (good enough proxy).
+        track_len = max(synced_lines[-1].get("time_seconds", 1.0), 30.0)
+        playback = anchor_song_seconds + (time.monotonic() - anchor_monotonic)
+        pct = max(0.0, min(1.0, playback / track_len))
+        canvas.coords(progress_bar_fill_id, x1, y1, x1 + (x2 - x1) * pct, y2)
+        canvas.itemconfigure(progress_bar_fill_id, fill=accent_color_hex)
+    except tk.TclError:
+        pass
+
+
 def refresh_lyrics_display():
     """Refreshes the visible lyrics and re-schedules the next sync tick."""
     global lyrics_update_job_id
@@ -1382,6 +2270,9 @@ def refresh_lyrics_display():
     if next_lines != lyrics_state.get("display_lines", []):
         lyrics_state["display_lines"] = next_lines
         update_lyrics_display_text()
+
+    # Cheap per-tick: advance the progress bar fill width.
+    tick_progress_bar()
 
     if lyrics_state.get("synced_lines"):
         interval_ms = max(100, int(config.get("lyrics", {}).get("refresh_interval_ms", 250)))
@@ -1431,13 +2322,20 @@ def set_status_message(message: str):
          schedule_gui_update(update_status_display_text)
 
 def update_status_display_text():
-    """Updates ONLY the text of the status label. Must run on Tk thread."""
-    if canvas and status_label_id:
-        try:
-            canvas.itemconfigure(status_label_id, text=current_status_message)
-            canvas.tag_raise(status_label_id)
-        except tk.TclError:
-             pass
+    """Re-renders the status pill (background + dot + label) since the text
+    length determines pill width."""
+    if not canvas or not status_pill_layout:
+        return
+    try:
+        render_status_pill(
+            status_pill_layout["text_x"],
+            status_pill_layout["text_y"],
+            anchor=status_pill_layout["anchor"],
+            font_size=status_pill_layout["font_size"],
+        )
+        canvas.tag_raise("status_pill")
+    except tk.TclError:
+        pass
 
 
 def update_images() -> Dict[str, Any]:
@@ -1492,14 +2390,21 @@ def update_images() -> Dict[str, Any]:
     gui_cfg = config['gui']
     lyrics_cfg = config.get("lyrics", {})
 
-    brightness = 0.5
+    global accent_color_hex
+    brightness = 0.2  # With vignette, foreground is always over a darkened scrim.
     try:
         if image_file_path.is_file():
             blurred_pil_image = create_blurred_background(
                 image_file_path, window_width, window_height, gui_cfg['blur_strength']
             )
             if blurred_pil_image:
-                brightness = calculate_brightness(blurred_pil_image)
+                # Extract accent BEFORE vignetting (color is truer pre-darken).
+                try:
+                    accent_color_hex = extract_accent_color(blurred_pil_image)
+                except Exception as e:
+                    logger.debug(f"Accent extract failed: {e}")
+                vignette_intensity = safe_float(gui_cfg.get("vignette_intensity")) or 0.55
+                blurred_pil_image = apply_vignette(blurred_pil_image, intensity=vignette_intensity)
                 bg_photo_ref = ImageTk.PhotoImage(blurred_pil_image)
                 canvas.delete("background")
                 canvas.create_image(0, 0, anchor=tk.NW, image=bg_photo_ref, tags=("background",))
@@ -1510,17 +2415,20 @@ def update_images() -> Dict[str, Any]:
         else:
             canvas.delete("background")
             bg_photo_ref = None
-            canvas.config(bg="black")
+            canvas.config(bg="#0a0a0c")
     except Exception as e:
         logger.exception(f"Error processing or setting background image: {e}")
         canvas.delete("background")
         bg_photo_ref = None
-        canvas.config(bg="black")
+        canvas.config(bg="#0a0a0c")
 
-    text_color = "black" if brightness > 0.55 else "white"
-    secondary_text_color = "#c7c7c7" if text_color == "white" else "#4f4f4f"
-    tertiary_text_color = "#8a8a8a" if text_color == "white" else "#6f6f6f"
+    # With the vignette overlay, foreground sits over a dark scrim regardless of
+    # cover-art brightness — so we lock to a dark-mode foreground palette.
+    text_color = "#ffffff"
+    secondary_text_color = "#cdd2da"
+    tertiary_text_color = "#8b919c"
     layout_info['text_color'] = text_color
+    layout_info['accent_color'] = accent_color_hex
 
     margin_ratio = safe_float(lyrics_cfg.get("panel_margin_ratio")) or 0.05
     panel_gap_ratio = safe_float(lyrics_cfg.get("panel_gap_ratio")) or 0.04
@@ -1638,13 +2546,13 @@ def update_images() -> Dict[str, Any]:
     })
 
     try:
-        title_font_obj = tkFont.Font(family="Arial", size=main_font_size, weight="bold")
-        album_font_obj = tkFont.Font(family="Arial", size=max(12, int(artist_font_size * 0.95)), slant="italic")
-        artist_font_obj = tkFont.Font(family="Arial", size=artist_font_size)
-        status_font_obj = tkFont.Font(family="Arial", size=status_font_size)
-        lyrics_primary_font_obj = tkFont.Font(family="Arial", size=lyrics_primary_font_size, weight="bold")
-        lyrics_secondary_font_obj = tkFont.Font(family="Arial", size=lyrics_secondary_font_size, weight="bold")
-        lyrics_tertiary_font_obj = tkFont.Font(family="Arial", size=lyrics_tertiary_font_size, weight="bold")
+        title_font_obj = tkFont.Font(family=get_ui_font_family(), size=main_font_size, weight="bold")
+        album_font_obj = tkFont.Font(family=get_ui_font_family(), size=max(12, int(artist_font_size * 0.95)), slant="italic")
+        artist_font_obj = tkFont.Font(family=get_ui_font_family(), size=artist_font_size)
+        status_font_obj = tkFont.Font(family=get_ui_font_family(), size=status_font_size)
+        lyrics_primary_font_obj = tkFont.Font(family=get_ui_font_family(), size=lyrics_primary_font_size, weight="bold")
+        lyrics_secondary_font_obj = tkFont.Font(family=get_ui_font_family(), size=lyrics_secondary_font_size, weight="bold")
+        lyrics_tertiary_font_obj = tkFont.Font(family=get_ui_font_family(), size=lyrics_tertiary_font_size, weight="bold")
         title_line_height = title_font_obj.metrics("linespace")
         album_line_height = album_font_obj.metrics("linespace")
         artist_line_height = artist_font_obj.metrics("linespace")
@@ -1653,13 +2561,13 @@ def update_images() -> Dict[str, Any]:
         secondary_line_height = lyrics_secondary_font_obj.metrics("linespace")
         tertiary_line_height = lyrics_tertiary_font_obj.metrics("linespace")
     except tk.TclError:
-        title_font_obj = ("Arial", main_font_size, "bold")
-        album_font_obj = ("Arial", max(12, int(artist_font_size * 0.95)), "italic")
-        artist_font_obj = ("Arial", artist_font_size)
-        status_font_obj = ("Arial", status_font_size)
-        lyrics_primary_font_obj = ("Arial", lyrics_primary_font_size, "bold")
-        lyrics_secondary_font_obj = ("Arial", lyrics_secondary_font_size, "bold")
-        lyrics_tertiary_font_obj = ("Arial", lyrics_tertiary_font_size, "bold")
+        title_font_obj = (get_ui_font_family(), main_font_size, "bold")
+        album_font_obj = (get_ui_font_family(), max(12, int(artist_font_size * 0.95)), "italic")
+        artist_font_obj = (get_ui_font_family(), artist_font_size)
+        status_font_obj = (get_ui_font_family(), status_font_size)
+        lyrics_primary_font_obj = (get_ui_font_family(), lyrics_primary_font_size, "bold")
+        lyrics_secondary_font_obj = (get_ui_font_family(), lyrics_secondary_font_size, "bold")
+        lyrics_tertiary_font_obj = (get_ui_font_family(), lyrics_tertiary_font_size, "bold")
         title_line_height = main_font_size * 1.2
         album_line_height = artist_font_size * 1.15
         artist_line_height = artist_font_size * 1.2
@@ -1779,22 +2687,33 @@ def update_images() -> Dict[str, Any]:
         else:
             artist_label_id = canvas.create_text(main_text_x, artist_y, text=artist_display_text, font=artist_font_obj, tags=("main_text",), fill=secondary_text_color, anchor=metadata_anchor, justify=metadata_justify, width=metadata_width)
 
-        if status_label_id:
-            canvas.coords(status_label_id, main_text_x, status_y)
-            canvas.itemconfigure(status_label_id, text=current_status_message, font=status_font_obj, fill=tertiary_text_color, anchor=metadata_anchor, justify=metadata_justify, width=metadata_width)
-        else:
-            status_label_id = canvas.create_text(main_text_x, status_y, text=current_status_message, font=status_font_obj, tags=("main_text",), fill=tertiary_text_color, anchor=metadata_anchor, justify=metadata_justify, width=metadata_width)
+        # Status now renders as a pill (rounded surface + animated dot + label)
+        # anchored at the same status_y position, instead of plain canvas text.
+        render_status_pill(
+            main_text_x,
+            status_y,
+            anchor=metadata_anchor,
+            font_size=status_font_size,
+        )
 
         canvas.delete("metadata_icon")
 
         render_lyrics_labels()
+        render_progress_bar(window_width, window_height)
         canvas.tag_raise("main_text")
+        canvas.tag_raise("status_pill")
+        canvas.tag_raise("progress_bar")
     except tk.TclError as e:
         logger.warning(f"TclError updating text labels: {e}. IDs reset.")
+        global status_pill_bg_id, status_pill_dot_id, progress_bar_track_id, progress_bar_fill_id
         title_label_id = None
         album_label_id = None
         artist_label_id = None
         status_label_id = None
+        status_pill_bg_id = None
+        status_pill_dot_id = None
+        progress_bar_track_id = None
+        progress_bar_fill_id = None
         lyrics_primary_label_id = None
         lyrics_secondary_label_id = None
         lyrics_tertiary_label_id = None
@@ -1840,12 +2759,12 @@ def redraw_history_display(layout_info: Dict[str, Any]):
         history_title_font_size = max(9, int(history_size * history_title_scale))
         history_artist_font_size = max(8, int(history_size * history_artist_scale))
         try:
-            history_title_font = tkFont.Font(family="Arial", size=history_title_font_size, slant="italic")
-            history_artist_font = tkFont.Font(family="Arial", size=history_artist_font_size, weight="bold")
+            history_title_font = tkFont.Font(family=get_ui_font_family(), size=history_title_font_size, slant="italic")
+            history_artist_font = tkFont.Font(family=get_ui_font_family(), size=history_artist_font_size, weight="bold")
             history_artist_line_height = history_artist_font.metrics("linespace")
         except tk.TclError:
-            history_title_font = ("Arial", history_title_font_size, "italic")
-            history_artist_font = ("Arial", history_artist_font_size, "bold")
+            history_title_font = (get_ui_font_family(), history_title_font_size, "italic")
+            history_artist_font = (get_ui_font_family(), history_artist_font_size, "bold")
             history_artist_line_height = history_artist_font_size * 1.2
 
         if not items_to_draw:
@@ -1893,7 +2812,7 @@ def redraw_history_display(layout_info: Dict[str, Any]):
                         history_title_font_size,
                         history_title_min_size,
                         history_title_max_height,
-                        family="Arial",
+                        family=get_ui_font_family(),
                         weight="normal",
                         slant="italic",
                         tags=("history_item", "history_text", "history_title"),
@@ -1959,14 +2878,14 @@ def redraw_history_display(layout_info: Dict[str, Any]):
     logger.debug(f"Base history font size: {history_font_size}, Actual used: {history_font_size_actual}")
 
     try:
-        history_font_italic = tkFont.Font(family="Arial", size=history_font_size_actual, slant="italic")
-        history_font_bold = tkFont.Font(family="Arial", size=history_font_size_actual, weight="bold")
+        history_font_italic = tkFont.Font(family=get_ui_font_family(), size=history_font_size_actual, slant="italic")
+        history_font_bold = tkFont.Font(family=get_ui_font_family(), size=history_font_size_actual, weight="bold")
         history_line_height = history_font_bold.metrics("linespace")
         text_block_height_for_spacing = (history_line_height * 2.8) + 4
     except tk.TclError:
         logger.warning("tkFont failed for history fonts.")
-        history_font_italic = ("Arial", history_font_size_actual, "italic")
-        history_font_bold = ("Arial", history_font_size_actual, "bold")
+        history_font_italic = (get_ui_font_family(), history_font_size_actual, "italic")
+        history_font_bold = (get_ui_font_family(), history_font_size_actual, "bold")
         history_line_height = history_font_size_actual * 1.3
         text_block_height_for_spacing = (history_line_height * 2.8) + 4
 
@@ -2113,7 +3032,7 @@ def redraw_history_display(layout_info: Dict[str, Any]):
                 history_font_size_actual,
                 history_title_min_size,
                 history_title_max_height,
-                family="Arial",
+                family=get_ui_font_family(),
                 weight="normal",
                 slant="italic",
                 tags=("history_item", "history_text", "history_title"),
@@ -2410,7 +3329,10 @@ def on_closing():
     logger.info("Shutdown sequence complete.")
 
 
-async def process_recognition_result(result: Dict[str, Any]) -> Dict[str, Any]:
+async def process_recognition_result(
+    result: Dict[str, Any],
+    record_start_monotonic: Optional[float] = None,
+) -> Dict[str, Any]:
     """Processes successful Shazam result: cache/download image, add to history, save state."""
     global song_history_list
     track_info = result.get('track', {})
@@ -2547,7 +3469,7 @@ async def process_recognition_result(result: Dict[str, Any]) -> Dict[str, Any]:
 
     path_to_save = persistent_path_for_this_song if cache_hit else final_persistent_path
     save_last_state(new_title, new_artist, new_album, path_to_save)
-    prepare_lyrics_for_track(result, new_title, new_artist)
+    prepare_lyrics_for_track(result, new_title, new_artist, record_start_monotonic)
 
     return {
         'status': 'success',
@@ -2596,7 +3518,7 @@ async def periodic_recognition_task(stop_event: threading.Event):
                         f"Retry capture {capture_attempt + 1}/{capture_attempts}..."
                     )
 
-                wav_file_path = record_audio(record_seconds_override=record_seconds)
+                wav_file_path, record_start_monotonic = record_audio(record_seconds_override=record_seconds)
 
                 if not wav_file_path:
                     if not stop_event.is_set():
@@ -2618,7 +3540,7 @@ async def periodic_recognition_task(stop_event: threading.Event):
 
                 if shazam_result:
                     if 'track' in shazam_result and shazam_result.get('track'):
-                        update_data = await process_recognition_result(shazam_result)
+                        update_data = await process_recognition_result(shazam_result, record_start_monotonic)
                         break
 
                     if 'matches' in shazam_result and not shazam_result.get('matches'):
@@ -2750,6 +3672,10 @@ def main():
 
     config = load_config()
     logger.info("--- Song Recognition Application Starting ---")
+    global lyrics_cache
+    lyrics_cache = load_lyrics_cache()
+    if lyrics_cache:
+        logger.info(f"Loaded lyrics cache: {len(lyrics_cache)} entries.")
     load_history_state()
     write_history_separator()
 
@@ -2778,8 +3704,11 @@ def main():
     else:
         logger.info(f"Starting windowed: {initial_width}x{initial_height}")
 
-    canvas = tk.Canvas(root, bg="black", highlightthickness=0)
+    canvas = tk.Canvas(root, bg="#0a0a0c", highlightthickness=0)
     canvas.pack(fill=tk.BOTH, expand=tk.YES)
+
+    # Warm the font cache now that Tk is up.
+    get_ui_font_family()
 
     title_label_id = None
     album_label_id = None
@@ -2798,6 +3727,7 @@ def main():
     root.update()
     root.after(100, trigger_full_redraw)
     root.after(100, reset_cursor_hide_timer)
+    root.after(300, tick_status_pulse)
 
     start_recognition_thread()
 
