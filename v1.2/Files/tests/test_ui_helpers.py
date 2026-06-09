@@ -67,3 +67,24 @@ def test_simulate_alpha_on_dark_full_opacity_unchanged():
 def test_simulate_alpha_on_dark_low_opacity_blends_to_scrim():
     result = shazam.simulate_alpha_on_dark("#ffffff", 0.0)
     assert result == "#0a0a0c"
+
+
+def test_breakpoint_wide_at_1920x1080():
+    assert shazam.detect_layout_breakpoint(1920, 1080) == "wide"
+
+
+def test_breakpoint_stacked_at_400x800():
+    assert shazam.detect_layout_breakpoint(400, 800) == "stacked"
+
+
+def test_breakpoint_stacked_when_narrower_than_900():
+    assert shazam.detect_layout_breakpoint(800, 1200) == "stacked"
+
+
+def test_breakpoint_mid_at_1024x900():
+    # width >= 900 satisfies wide-width, but aspect 1.137 < 1.2 -> mid.
+    assert shazam.detect_layout_breakpoint(1024, 900) == "mid"
+
+
+def test_breakpoint_handles_zero_height():
+    assert shazam.detect_layout_breakpoint(800, 0) == "stacked"

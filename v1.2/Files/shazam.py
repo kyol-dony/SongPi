@@ -715,6 +715,21 @@ def draw_rounded_rect(canvas_obj: tk.Canvas, x1: float, y1: float, x2: float, y2
     return canvas_obj.create_polygon(points, fill=fill, outline=outline,
                                      smooth=True, splinesteps=24, tags=tags)
 
+
+# --- Layout system ---
+
+def detect_layout_breakpoint(width: int, height: int) -> str:
+    """Returns 'wide', 'mid', or 'stacked' based on window dimensions per spec §4."""
+    if height <= 0:
+        return "stacked"
+    aspect = width / height
+    if width >= 900 and aspect >= 1.2:
+        return "wide"
+    if width < 900 or aspect < 0.95:
+        return "stacked"
+    return "mid"
+
+
 def create_placeholder_image(path: Path, width: int, height: int, text: str) -> bool:
     """Creates a simple placeholder image with text and saves it."""
     logger.info(f"Creating placeholder image at: {path}")
