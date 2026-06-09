@@ -29,3 +29,20 @@ def test_responsive_clamp_clamps_high():
 
 def test_responsive_clamp_handles_float():
     assert shazam.responsive_clamp(0.0, 1.5, 2.0) == 1.5
+
+
+def test_ease_out_cubic_starts_at_zero():
+    assert shazam.ease_out_cubic(0.0) == 0.0
+
+
+def test_ease_out_cubic_ends_at_one():
+    assert shazam.ease_out_cubic(1.0) == 1.0
+
+
+def test_ease_out_cubic_is_above_linear_in_middle():
+    assert shazam.ease_out_cubic(0.5) > 0.5
+
+
+def test_ease_out_cubic_clamps_input():
+    assert shazam.ease_out_cubic(-0.5) == 0.0
+    assert shazam.ease_out_cubic(2.0) == 1.0

@@ -1117,6 +1117,12 @@ def responsive_clamp(min_value: float, value: float, max_value: float) -> float:
     return value
 
 
+def ease_out_cubic(t: float) -> float:
+    """Cubic ease-out: fast start, gentle landing. Domain and range [0, 1]."""
+    t = max(0.0, min(1.0, t))
+    return 1.0 - (1.0 - t) ** 3
+
+
 def fit_canvas_title_font(
     canvas_obj: tk.Canvas,
     text_item_id: Optional[int],
