@@ -19,10 +19,18 @@ last_state.json
 history_state.json
 image.jpg
 image_temp.jpg
+lyrics_cache.json
+**/lyrics_cache.json
 /bin/
 /include/
 /lib/
 /pyvenv.cfg
+
+# Superpowers / brainstorming scratch
+.superpowers/
+**/.superpowers/
+.claude/cache/
+**/.claude/cache/
 
 # OS cruft
 .DS_Store
