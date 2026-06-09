@@ -75,6 +75,8 @@ lyrics_primary_label_id: Optional[int] = None
 lyrics_secondary_label_id: Optional[int] = None
 lyrics_tertiary_label_id: Optional[int] = None
 coverart_item_id: Optional[int] = None
+cover_halo_photo_ref: Optional["ImageTk.PhotoImage"] = None
+cover_halo_item_id: Optional[int] = None
 
 accent_color_hex: str = "#7c8fff"   # Cover-art derived accent; updated per track.
 ui_font_family_cache: Optional[str] = None
@@ -687,6 +689,63 @@ def apply_vignette(image: Image.Image, intensity: float = 0.55) -> Image.Image:
     except Exception as e:
         logger.debug(f"Vignette failed: {e}")
         return image
+
+
+def build_cover_halo(cover_size: int, accent_hex: str, intensity: float) -> Optional[Image.Image]:
+    """Returns a PIL RGBA image of a soft accent-colored halo sized 1.18× the
+    cover. Used as a glow plate placed behind the cover art."""
+    try:
+        side = max(8, int(cover_size * 1.18))
+        halo = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(halo)
+        r, g, b = hex_to_rgb(accent_hex)
+        alpha = int(255 * max(0.0, min(1.0, intensity)))
+        margin = side // 8
+        draw.ellipse([margin, margin, side - margin, side - margin],
+                     fill=(r, g, b, alpha))
+        blur_px = max(8, side // 8)
+        return halo.filter(ImageFilter.GaussianBlur(blur_px))
+    except Exception as e:
+        logger.debug(f"build_cover_halo failed: {e}")
+        return None
+
+
+def render_cover_halo(square_x: float, square_y: float, square_size: int) -> None:
+    """Renders (or refreshes) the accent halo behind the cover art."""
+    global cover_halo_photo_ref, cover_halo_item_id
+    if not canvas:
+        return
+    intensity = safe_float(config.get("gui", {}).get("accent_halo_intensity")) or 0.35
+    halo_image = build_cover_halo(square_size, accent_color_hex, intensity)
+    if halo_image is None:
+        if cover_halo_item_id:
+            try:
+                canvas.delete(cover_halo_item_id)
+            except tk.TclError:
+                pass
+            cover_halo_item_id = None
+        cover_halo_photo_ref = None
+        return
+    cover_halo_photo_ref = ImageTk.PhotoImage(halo_image)
+    if cover_halo_item_id:
+        try:
+            canvas.coords(cover_halo_item_id, square_x, square_y)
+            canvas.itemconfigure(cover_halo_item_id, image=cover_halo_photo_ref)
+        except tk.TclError:
+            cover_halo_item_id = None
+    if not cover_halo_item_id:
+        cover_halo_item_id = canvas.create_image(
+            square_x, square_y,
+            anchor=tk.CENTER,
+            image=cover_halo_photo_ref,
+            tags=("background", "cover_halo"),
+        )
+    try:
+        canvas.tag_raise("cover_halo", "background")
+        if coverart_item_id:
+            canvas.tag_raise(coverart_item_id, "cover_halo")
+    except tk.TclError:
+        pass
 
 
 def draw_rounded_rect(canvas_obj: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
@@ -2588,6 +2647,8 @@ def update_images() -> Dict[str, Any]:
                         tags=("coverart",)
                     )
                 canvas.tag_raise(coverart_item_id)
+                # Paint accent halo plate behind the cover art.
+                render_cover_halo(square_x, square_y, int(square_size))
         except Exception as e:
             logger.exception(f"Error loading/processing main cover art image {image_file_path}: {e}")
             if coverart_item_id:
