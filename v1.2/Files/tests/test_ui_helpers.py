@@ -2,6 +2,7 @@
 import importlib
 import sys
 import types
+from unittest.mock import patch
 
 # Stub out modules shazam.py imports that require native libs.
 for mod_name in ("pyaudio", "screeninfo", "shazamio"):
@@ -107,3 +108,39 @@ def test_type_scale_clamps_at_large_size():
     scale = shazam.compute_type_scale(4000)
     assert scale["title"] == 38
     assert scale["lyric_active"] == 64
+
+
+def test_low_power_true_for_armv7():
+    with patch("platform.machine", return_value="armv7l"), \
+         patch("os.cpu_count", return_value=4):
+        assert shazam.is_low_power_host() is True
+
+
+def test_low_power_false_for_aarch64():
+    with patch("platform.machine", return_value="aarch64"), \
+         patch("os.cpu_count", return_value=4):
+        assert shazam.is_low_power_host() is False
+
+
+def test_low_power_false_for_x86_64():
+    with patch("platform.machine", return_value="x86_64"), \
+         patch("os.cpu_count", return_value=8):
+        assert shazam.is_low_power_host() is False
+
+
+def test_motion_enabled_when_config_false_and_high_power():
+    cfg = {"gui": {"motion_reduced": False}}
+    with patch.object(shazam, "is_low_power_host", return_value=False):
+        assert shazam.is_motion_enabled(cfg) is True
+
+
+def test_motion_disabled_when_config_true():
+    cfg = {"gui": {"motion_reduced": True}}
+    with patch.object(shazam, "is_low_power_host", return_value=False):
+        assert shazam.is_motion_enabled(cfg) is False
+
+
+def test_motion_disabled_on_low_power_even_if_config_false():
+    cfg = {"gui": {"motion_reduced": False}}
+    with patch.object(shazam, "is_low_power_host", return_value=True):
+        assert shazam.is_motion_enabled(cfg) is False

@@ -730,6 +730,22 @@ def detect_layout_breakpoint(width: int, height: int) -> str:
     return "mid"
 
 
+def is_low_power_host() -> bool:
+    """Heuristic: Pi 3 (armv7) is the canonical low-power target. Anything
+    armv7 with <=4 cores triggers the reduced-motion profile by default."""
+    import platform
+    machine = platform.machine().lower()
+    cpu_count = os.cpu_count() or 1
+    return machine.startswith("armv7") and cpu_count <= 4
+
+
+def is_motion_enabled(cfg: Dict[str, Any]) -> bool:
+    """True when full motion (Ken Burns, glow breath, choreography) should run."""
+    if bool(cfg.get("gui", {}).get("motion_reduced", False)):
+        return False
+    return not is_low_power_host()
+
+
 def compute_type_scale(short_edge: int) -> Dict[str, int]:
     """Maps window short-edge px to the responsive type sizes from spec §3."""
     s = max(0, int(short_edge))
