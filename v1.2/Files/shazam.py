@@ -87,6 +87,13 @@ status_pill_layout: Dict[str, Any] = {}   # Cached args for re-rendering on text
 lyric_glow_phase: float = 0.0
 lyric_glow_job_id: Optional[str] = None
 
+lyric_transition_state: Dict[str, Any] = {
+    "active": False,
+    "start_monotonic": 0.0,
+    "duration": 0.32,
+    "last_index": -1,
+}
+
 bg_photo_ref: Optional[ImageTk.PhotoImage] = None
 square_photo_ref: Optional[ImageTk.PhotoImage] = None
 history_photo_refs: List[Dict[str, Any]] = []
@@ -2077,7 +2084,21 @@ def compute_current_lyrics_lines() -> List[str]:
             - lrc_offset
             + user_adjust
         )
-        return build_synced_lyrics_lines(max(0.0, playback_seconds))
+        playback_seconds = max(0.0, playback_seconds)
+
+        # Detect line advances → start a fade-in transition.
+        active_index = -1
+        for i, line in enumerate(lyrics_state["synced_lines"]):
+            if playback_seconds >= line["time_seconds"]:
+                active_index = i
+            else:
+                break
+        if active_index != lyric_transition_state["last_index"] and is_motion_enabled(config):
+            lyric_transition_state["active"] = True
+            lyric_transition_state["start_monotonic"] = time.monotonic()
+        lyric_transition_state["last_index"] = active_index
+
+        return build_synced_lyrics_lines(playback_seconds)
 
     if config.get("lyrics", {}).get("show_plain_lyrics", True):
         plain_lines = [line.strip() for line in lyrics_state.get("plain_lyrics", "").splitlines() if line.strip()]
@@ -2375,6 +2396,38 @@ def tick_lyric_glow():
         lyric_glow_job_id = None
 
 
+def tick_lyric_transition():
+    """Applies the per-frame fade-in for a freshly-advanced lyric line.
+
+    Active for `lyric_transition_state['duration']` seconds after a line
+    change; blends the active line's color from a low-opacity accent toward
+    full while shifting it vertically by a few pixels (ease-out)."""
+    if not lyric_transition_state.get("active"):
+        return
+    if not canvas or not lyrics_primary_label_id:
+        return
+    elapsed = time.monotonic() - lyric_transition_state["start_monotonic"]
+    duration = lyric_transition_state["duration"]
+    if elapsed >= duration:
+        lyric_transition_state["active"] = False
+        return
+    t = ease_out_cubic(elapsed / duration)
+    accent_rgb = hex_to_rgb(accent_color_hex)
+    base = mix_rgb(accent_rgb, (255, 255, 255), 0.35)
+    start_color = simulate_alpha_on_dark(rgb_to_hex(base), 0.4)
+    end_color = rgb_to_hex(base)
+    blended = mix_rgb(hex_to_rgb(start_color), hex_to_rgb(end_color), t)
+    try:
+        canvas.itemconfigure(lyrics_primary_label_id, fill=rgb_to_hex(blended))
+        offset = int(8 * (1.0 - t))
+        coords = canvas.coords(lyrics_primary_label_id)
+        if len(coords) >= 2:
+            base_y = lyrics_layout_cache.get("primary_y", coords[1])
+            canvas.coords(lyrics_primary_label_id, coords[0], base_y + offset)
+    except tk.TclError:
+        lyric_transition_state["active"] = False
+
+
 def render_progress_bar(window_width: int, window_height: int) -> None:
     """Draws a slim accent-tinted progress bar at the bottom of the canvas,
     reflecting the current song playback position from the sync anchor."""
@@ -2462,6 +2515,7 @@ def refresh_lyrics_display():
 
     # Cheap per-tick: advance the progress bar fill width.
     tick_progress_bar()
+    tick_lyric_transition()
 
     if lyrics_state.get("synced_lines"):
         interval_ms = max(100, int(config.get("lyrics", {}).get("refresh_interval_ms", 250)))
