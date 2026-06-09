@@ -2782,10 +2782,6 @@ def update_images() -> Dict[str, Any]:
         album_text = last_album_name.strip()
         album_display_text = album_text
         artist_display_text = last_artist_name
-        if cinematic_mode:
-            title_display_text = f"♩ {last_track_title}" if last_track_title else ""
-            album_display_text = f"◎ {album_text}" if album_text else ""
-            artist_display_text = f"◌ {last_artist_name}" if last_artist_name else ""
 
         title_label_id, title_font_obj, title_bbox = fit_canvas_title_font(
             canvas,
