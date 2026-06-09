@@ -88,3 +88,22 @@ def test_breakpoint_mid_at_1024x900():
 
 def test_breakpoint_handles_zero_height():
     assert shazam.detect_layout_breakpoint(800, 0) == "stacked"
+
+
+def test_type_scale_at_1080_short_edge():
+    scale = shazam.compute_type_scale(1080)
+    assert scale["title"] == int(shazam.responsive_clamp(18, int(1080 * 0.035), 38))
+    assert scale["lyric_active"] == int(shazam.responsive_clamp(22, int(1080 * 0.052), 64))
+    assert scale["lyric_context"] == int(shazam.responsive_clamp(13, int(1080 * 0.025), 24))
+
+
+def test_type_scale_clamps_at_small_size():
+    scale = shazam.compute_type_scale(200)
+    assert scale["title"] == 18
+    assert scale["lyric_active"] == 22
+
+
+def test_type_scale_clamps_at_large_size():
+    scale = shazam.compute_type_scale(4000)
+    assert scale["title"] == 38
+    assert scale["lyric_active"] == 64

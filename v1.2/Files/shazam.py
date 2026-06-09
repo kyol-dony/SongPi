@@ -730,6 +730,22 @@ def detect_layout_breakpoint(width: int, height: int) -> str:
     return "mid"
 
 
+def compute_type_scale(short_edge: int) -> Dict[str, int]:
+    """Maps window short-edge px to the responsive type sizes from spec §3."""
+    s = max(0, int(short_edge))
+    return {
+        "title":          int(responsive_clamp(18, s * 0.035, 38)),
+        "artist":         int(responsive_clamp(11, s * 0.018, 18)),
+        "album":          int(responsive_clamp(10, s * 0.015, 15)),
+        "lyric_active":   int(responsive_clamp(22, s * 0.052, 64)),
+        "lyric_context":  int(responsive_clamp(13, s * 0.025, 24)),
+        "status_pill":    int(responsive_clamp(9,  s * 0.013, 14)),
+        "history_title":  int(responsive_clamp(9,  s * 0.013, 13)),
+        "history_artist": int(responsive_clamp(8,  s * 0.011, 11)),
+        "wordmark":       int(responsive_clamp(28, s * 0.060, 96)),
+    }
+
+
 def create_placeholder_image(path: Path, width: int, height: int, text: str) -> bool:
     """Creates a simple placeholder image with text and saves it."""
     logger.info(f"Creating placeholder image at: {path}")
