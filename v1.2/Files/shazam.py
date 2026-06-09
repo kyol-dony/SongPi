@@ -2360,6 +2360,26 @@ def render_lyrics_labels():
     canvas.tag_raise("main_text")
 
 
+def classify_status_state(message: str) -> str:
+    """Maps a status message string to a state token consumed by the pill renderer."""
+    msg = (message or "").lower()
+    if not msg.strip():
+        return "idle"
+    if "error" in msg or "offline" in msg:
+        return "error"
+    if "no match" in msg:
+        return "no_match"
+    if "init" in msg or "starting" in msg:
+        return "starting"
+    if "ready" in msg or "restored" in msg:
+        return "ready"
+    if "recogni" in msg or "retry" in msg:
+        return "recognizing"
+    if "listen" in msg or "fetch" in msg or "loading" in msg:
+        return "listening"
+    return "idle"
+
+
 def render_status_pill(text_x: float, text_y: float, anchor: str, font_size: int) -> None:
     """Draws the status row as a rounded pill (dot + label).
 
@@ -2415,10 +2435,16 @@ def render_status_pill(text_x: float, text_y: float, anchor: str, font_size: int
         existing_id=status_pill_bg_id,
     )
 
-    # Dot — accent color when "working", muted grey when idle.
-    msg_lower = label_text.lower()
-    working = any(k in msg_lower for k in ("listen", "recogni", "retry", "loading", "fetch"))
-    dot_color = accent_color_hex if working else "#5b6270"
+    # Dot color is driven by classified state.
+    state = classify_status_state(label_text)
+    if state in ("listening", "recognizing", "starting"):
+        dot_color = accent_color_hex
+    elif state == "error":
+        dot_color = "#dc2626"
+    elif state == "no_match":
+        dot_color = "#8b919c"
+    else:
+        dot_color = "#5b6270"
     dot_cx = x1 + pad_x + dot_radius
     dot_cy = (y1 + y2) / 2
     if status_pill_dot_id:
@@ -2474,8 +2500,8 @@ def tick_status_pulse():
         return
     try:
         if status_pill_dot_id:
-            msg_lower = (current_status_message or "").lower()
-            working = any(k in msg_lower for k in ("listen", "recogni", "retry", "loading", "fetch"))
+            state = classify_status_state(current_status_message)
+            working = state in ("listening", "recognizing", "starting")
             if working:
                 status_pulse_phase = (status_pulse_phase + 0.25) % (2 * math.pi)
                 pulse = 0.5 + 0.5 * math.sin(status_pulse_phase)  # 0..1

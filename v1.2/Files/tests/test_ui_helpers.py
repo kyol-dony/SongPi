@@ -205,3 +205,31 @@ def test_should_not_show_idle_splash_within_threshold():
         has_active_track=False,
         cfg=cfg,
     ) is False
+
+
+def test_status_state_listening():
+    assert shazam.classify_status_state("Listening...") == "listening"
+
+
+def test_status_state_recognizing():
+    assert shazam.classify_status_state("Recognizing...") == "recognizing"
+
+
+def test_status_state_no_match():
+    assert shazam.classify_status_state("No Match Found") == "no_match"
+
+
+def test_status_state_error():
+    assert shazam.classify_status_state("Error: Recognition failed") == "error"
+
+
+def test_status_state_starting():
+    assert shazam.classify_status_state("Initialising...") == "starting"
+
+
+def test_status_state_ready():
+    assert shazam.classify_status_state("Ready (Restored)") == "ready"
+
+
+def test_status_state_default_falls_to_idle():
+    assert shazam.classify_status_state("") == "idle"
