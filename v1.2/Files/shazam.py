@@ -597,6 +597,22 @@ def hex_to_rgb(value: str) -> Tuple[int, int, int]:
         return (124, 143, 255)
 
 
+SCRIM_RGB: Tuple[int, int, int] = (10, 10, 12)  # #0a0a0c — same as canvas bg fallback.
+
+
+def dim_hex(value: str, amount: float) -> str:
+    """Blends a hex color toward black by `amount` (0..1). amount=1 → black."""
+    rgb = hex_to_rgb(value)
+    return rgb_to_hex(mix_rgb(rgb, (0, 0, 0), amount))
+
+
+def simulate_alpha_on_dark(value: str, alpha: float) -> str:
+    """Tk text has no alpha — simulate by blending the color toward the dark scrim.
+    alpha=1.0 returns the color unchanged; alpha=0.0 returns the scrim color."""
+    alpha = max(0.0, min(1.0, alpha))
+    return rgb_to_hex(mix_rgb(SCRIM_RGB, hex_to_rgb(value), alpha))
+
+
 def extract_accent_color(image: Image.Image) -> str:
     """Picks a vibrant accent color from the cover art.
 

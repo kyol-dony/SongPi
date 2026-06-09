@@ -46,3 +46,24 @@ def test_ease_out_cubic_is_above_linear_in_middle():
 def test_ease_out_cubic_clamps_input():
     assert shazam.ease_out_cubic(-0.5) == 0.0
     assert shazam.ease_out_cubic(2.0) == 1.0
+
+
+def test_dim_hex_full_amount_returns_black():
+    assert shazam.dim_hex("#ffffff", 1.0) == "#000000"
+
+
+def test_dim_hex_zero_amount_unchanged():
+    assert shazam.dim_hex("#ff8000", 0.0) == "#ff8000"
+
+
+def test_dim_hex_half_amount():
+    assert shazam.dim_hex("#ff0000", 0.5) == "#7f0000"
+
+
+def test_simulate_alpha_on_dark_full_opacity_unchanged():
+    assert shazam.simulate_alpha_on_dark("#ffffff", 1.0) == "#ffffff"
+
+
+def test_simulate_alpha_on_dark_low_opacity_blends_to_scrim():
+    result = shazam.simulate_alpha_on_dark("#ffffff", 0.0)
+    assert result == "#0a0a0c"
