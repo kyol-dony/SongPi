@@ -3302,12 +3302,13 @@ def update_images() -> Dict[str, Any]:
         )
         title_block_bottom = title_bbox[3]
 
-        # Spacing between meta lines, scaled to the actual rendered font heights.
-        # Gap is a proportion of the *next* line's height so it feels balanced
-        # whether the title wrapped or not.
-        title_to_album_gap = max(6, int(album_line_height * 0.45))
-        album_to_artist_gap = max(6, int(artist_line_height * 0.35))
-        artist_to_status_gap = max(10, int(status_line_height * 0.7))
+        # Equal spacing between every meta line (title / album / artist).
+        # Status pill gets a slightly larger gap so the supporting chrome
+        # reads as a distinct row rather than another meta line.
+        meta_line_gap = max(8, int(artist_line_height * 0.5))
+        title_to_album_gap = meta_line_gap
+        album_to_artist_gap = meta_line_gap
+        artist_to_status_gap = max(meta_line_gap, int(status_line_height * 0.9))
 
         # Render album using fit_canvas_title_font so we get word-fit protection
         # and a true bbox; stack the next line from that bbox bottom.
@@ -3481,7 +3482,10 @@ def redraw_history_display(layout_info: Dict[str, Any]):
             logger.info("--- History Redraw End (No cinematic history entries after current track) ---")
             return
 
-        item_count = max(1, len(items_to_draw))
+        # Recent strip uses a single foreground color for every item — the
+        # progressive fade read as "broken UI" more than visual hierarchy.
+        recent_title_color = text_color
+        recent_artist_color = "#cdd2da"
         for index, item in enumerate(items_to_draw):
             img_path_str = item.get('image_path')
             if not img_path_str:
@@ -3496,11 +3500,6 @@ def redraw_history_display(layout_info: Dict[str, Any]):
                 break
             text_x = img_x + history_size + history_text_gap
             title_y = img_y + max(0, int(history_size * 0.08))
-
-            # Newest = 100%, oldest = 50%, linear.
-            opacity = 1.0 - (index / max(1, item_count - 1)) * 0.5 if item_count > 1 else 1.0
-            faded_title = simulate_alpha_on_dark(text_color, opacity)
-            faded_artist = simulate_alpha_on_dark("#cdd2da", opacity * 0.85)
 
             try:
                 with Image.open(img_path) as img:
@@ -3522,7 +3521,7 @@ def redraw_history_display(layout_info: Dict[str, Any]):
                         text_x,
                         title_y,
                         history_text_width,
-                        faded_title,
+                        recent_title_color,
                         tk.NW,
                         tk.LEFT,
                         history_title_font_size,
@@ -3542,7 +3541,7 @@ def redraw_history_display(layout_info: Dict[str, Any]):
                         justify=tk.LEFT,
                         width=history_text_width,
                         font=history_artist_font,
-                        fill=faded_artist,
+                        fill=recent_artist_color,
                         tags=("history_item", "history_text", "history_artist")
                     )
                     history_photo_refs.append({
