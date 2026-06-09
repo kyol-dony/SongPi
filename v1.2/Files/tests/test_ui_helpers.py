@@ -165,3 +165,43 @@ def test_format_artist_label_skips_tracking_when_long():
 
 def test_format_artist_label_empty():
     assert shazam.format_artist_label("") == ""
+
+
+def test_should_show_idle_splash_when_no_recent_match():
+    cfg = {"gui": {"idle_splash_enabled": True, "idle_splash_after_seconds": 10}}
+    assert shazam.should_show_idle_splash(
+        last_match_monotonic=0.0,
+        now_monotonic=100.0,
+        has_active_track=False,
+        cfg=cfg,
+    ) is True
+
+
+def test_should_not_show_idle_splash_when_track_active():
+    cfg = {"gui": {"idle_splash_enabled": True, "idle_splash_after_seconds": 10}}
+    assert shazam.should_show_idle_splash(
+        last_match_monotonic=0.0,
+        now_monotonic=100.0,
+        has_active_track=True,
+        cfg=cfg,
+    ) is False
+
+
+def test_should_not_show_idle_splash_when_disabled():
+    cfg = {"gui": {"idle_splash_enabled": False, "idle_splash_after_seconds": 10}}
+    assert shazam.should_show_idle_splash(
+        last_match_monotonic=0.0,
+        now_monotonic=100.0,
+        has_active_track=False,
+        cfg=cfg,
+    ) is False
+
+
+def test_should_not_show_idle_splash_within_threshold():
+    cfg = {"gui": {"idle_splash_enabled": True, "idle_splash_after_seconds": 10}}
+    assert shazam.should_show_idle_splash(
+        last_match_monotonic=95.0,
+        now_monotonic=100.0,
+        has_active_track=False,
+        cfg=cfg,
+    ) is False

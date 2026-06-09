@@ -94,6 +94,8 @@ lyric_transition_state: Dict[str, Any] = {
     "last_index": -1,
 }
 
+last_recognition_monotonic: float = 0.0   # Updated when a match resolves.
+
 bg_photo_ref: Optional[ImageTk.PhotoImage] = None
 square_photo_ref: Optional[ImageTk.PhotoImage] = None
 history_photo_refs: List[Dict[str, Any]] = []
@@ -830,6 +832,19 @@ def is_motion_enabled(cfg: Dict[str, Any]) -> bool:
     if bool(cfg.get("gui", {}).get("motion_reduced", False)):
         return False
     return not is_low_power_host()
+
+
+def should_show_idle_splash(last_match_monotonic: float, now_monotonic: float,
+                            has_active_track: bool, cfg: Dict[str, Any]) -> bool:
+    """Splash if: enabled, no active track, and >= idle_splash_after_seconds
+    have elapsed since any successful match."""
+    gui_cfg = cfg.get("gui", {})
+    if not bool(gui_cfg.get("idle_splash_enabled", True)):
+        return False
+    if has_active_track:
+        return False
+    threshold = safe_float(gui_cfg.get("idle_splash_after_seconds")) or 10.0
+    return (now_monotonic - last_match_monotonic) >= threshold
 
 
 def compute_type_scale(short_edge: int) -> Dict[str, int]:
@@ -3583,7 +3598,8 @@ async def process_recognition_result(
     record_start_monotonic: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Processes successful Shazam result: cache/download image, add to history, save state."""
-    global song_history_list
+    global song_history_list, last_recognition_monotonic
+    last_recognition_monotonic = time.monotonic()
     track_info = result.get('track', {})
     new_title = track_info.get('title', 'Unknown Title')
     new_artist = track_info.get('subtitle', 'Unknown Artist')
