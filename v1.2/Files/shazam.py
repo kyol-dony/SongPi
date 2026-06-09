@@ -2673,12 +2673,14 @@ def update_images() -> Dict[str, Any]:
         square_photo_ref = None
 
     if cinematic_mode:
-        main_font_size = max(18, min(34, int(window_width * 0.032)))
-        artist_font_size = max(12, int(main_font_size * 0.42))
-        status_font_size = max(10, int(main_font_size * 0.32))
-        lyrics_primary_font_size = max(24, min(58, int(window_width * 0.047)))
-        lyrics_secondary_font_size = max(18, int(lyrics_primary_font_size * 0.62))
-        lyrics_tertiary_font_size = max(16, int(lyrics_primary_font_size * 0.54))
+        type_scale = compute_type_scale(min(window_width, window_height))
+        main_font_size = type_scale["title"]
+        artist_font_size = type_scale["artist"]
+        status_font_size = type_scale["status_pill"]
+        lyrics_primary_font_size = type_scale["lyric_active"]
+        # Context lines target ~55% of active per spec (active = ~1.6× context).
+        lyrics_secondary_font_size = max(13, int(lyrics_primary_font_size * 0.55))
+        lyrics_tertiary_font_size = max(12, int(lyrics_primary_font_size * 0.48))
     else:
         base_font_size = gui_cfg['base_font_size']
         scale_factor = 0.045
