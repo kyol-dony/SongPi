@@ -3014,6 +3014,7 @@ def redraw_history_display(layout_info: Dict[str, Any]):
             logger.info("--- History Redraw End (No cinematic history entries after current track) ---")
             return
 
+        item_count = max(1, len(items_to_draw))
         for index, item in enumerate(items_to_draw):
             img_path_str = item.get('image_path')
             if not img_path_str:
@@ -3028,6 +3029,11 @@ def redraw_history_display(layout_info: Dict[str, Any]):
                 break
             text_x = img_x + history_size + history_text_gap
             title_y = img_y + max(0, int(history_size * 0.08))
+
+            # Newest = 100%, oldest = 50%, linear.
+            opacity = 1.0 - (index / max(1, item_count - 1)) * 0.5 if item_count > 1 else 1.0
+            faded_title = simulate_alpha_on_dark(text_color, opacity)
+            faded_artist = simulate_alpha_on_dark("#cdd2da", opacity * 0.85)
 
             try:
                 with Image.open(img_path) as img:
@@ -3049,7 +3055,7 @@ def redraw_history_display(layout_info: Dict[str, Any]):
                         text_x,
                         title_y,
                         history_text_width,
-                        text_color,
+                        faded_title,
                         tk.NW,
                         tk.LEFT,
                         history_title_font_size,
@@ -3069,7 +3075,7 @@ def redraw_history_display(layout_info: Dict[str, Any]):
                         justify=tk.LEFT,
                         width=history_text_width,
                         font=history_artist_font,
-                        fill=text_color,
+                        fill=faded_artist,
                         tags=("history_item", "history_text", "history_artist")
                     )
                     history_photo_refs.append({
