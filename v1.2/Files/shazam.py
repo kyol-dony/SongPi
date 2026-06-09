@@ -84,6 +84,9 @@ status_pulse_phase: float = 0.0
 status_pulse_job_id: Optional[str] = None
 status_pill_layout: Dict[str, Any] = {}   # Cached args for re-rendering on text change
 
+lyric_glow_phase: float = 0.0
+lyric_glow_job_id: Optional[str] = None
+
 bg_photo_ref: Optional[ImageTk.PhotoImage] = None
 square_photo_ref: Optional[ImageTk.PhotoImage] = None
 history_photo_refs: List[Dict[str, Any]] = []
@@ -2340,6 +2343,38 @@ def tick_status_pulse():
         status_pulse_job_id = None
 
 
+def tick_lyric_glow():
+    """Drives the breathing-glow color cycle on the active lyric line.
+
+    Sin-curve over ~3.6s, blending between the base active color and a
+    brighter variant. Disabled when motion is reduced."""
+    global lyric_glow_job_id, lyric_glow_phase
+    lyric_glow_job_id = None
+    if not root or not canvas or not root.winfo_exists():
+        return
+    if not is_motion_enabled(config):
+        try:
+            lyric_glow_job_id = root.after(1000, tick_lyric_glow)
+        except tk.TclError:
+            lyric_glow_job_id = None
+        return
+    try:
+        if lyrics_primary_label_id and lyrics_state.get("synced_lines"):
+            lyric_glow_phase = (lyric_glow_phase + (2 * math.pi / 36)) % (2 * math.pi)
+            pulse = 0.5 + 0.5 * math.sin(lyric_glow_phase)
+            accent_rgb = hex_to_rgb(accent_color_hex)
+            base = mix_rgb(accent_rgb, (255, 255, 255), 0.35)
+            bright = mix_rgb(accent_rgb, (255, 255, 255), 0.55)
+            blended = mix_rgb(base, bright, pulse * 0.6)
+            canvas.itemconfigure(lyrics_primary_label_id, fill=rgb_to_hex(blended))
+    except tk.TclError:
+        pass
+    try:
+        lyric_glow_job_id = root.after(100, tick_lyric_glow)
+    except tk.TclError:
+        lyric_glow_job_id = None
+
+
 def render_progress_bar(window_width: int, window_height: int) -> None:
     """Draws a slim accent-tinted progress bar at the bottom of the canvas,
     reflecting the current song playback position from the sync anchor."""
@@ -3882,6 +3917,7 @@ def main():
     root.after(100, trigger_full_redraw)
     root.after(100, reset_cursor_hide_timer)
     root.after(300, tick_status_pulse)
+    root.after(400, tick_lyric_glow)
 
     start_recognition_thread()
 
