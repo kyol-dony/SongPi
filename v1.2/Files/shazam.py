@@ -96,6 +96,11 @@ lyric_transition_state: Dict[str, Any] = {
 
 last_recognition_monotonic: float = 0.0   # Updated when a match resolves.
 
+idle_splash_active: bool = False
+idle_splash_bg_id: Optional[int] = None
+idle_splash_bg_photo_ref: Optional["ImageTk.PhotoImage"] = None
+idle_splash_wordmark_id: Optional[int] = None
+
 bg_photo_ref: Optional[ImageTk.PhotoImage] = None
 square_photo_ref: Optional[ImageTk.PhotoImage] = None
 history_photo_refs: List[Dict[str, Any]] = []
@@ -701,6 +706,116 @@ def apply_vignette(image: Image.Image, intensity: float = 0.55) -> Image.Image:
     except Exception as e:
         logger.debug(f"Vignette failed: {e}")
         return image
+
+
+SPLASH_STOPS = [
+    (124, 143, 255),    # cool indigo
+    (200, 110, 180),    # warm pink
+    (140, 200, 230),    # cool sky
+]
+
+
+def build_splash_gradient(width: int, height: int, phase: float = 0.0) -> Image.Image:
+    """Three-stop mesh-gradient backdrop for the idle splash. `phase` rotates
+    which stops anchor which corners (so consecutive renders shift mood)."""
+    try:
+        scale = 6  # render small + upscale, much faster than per-pixel at native res
+        sw, sh = max(8, width // scale), max(8, height // scale)
+        layer = Image.new("RGB", (sw, sh), (10, 10, 12))
+        pix = layer.load()
+        offset = int(phase) % len(SPLASH_STOPS)
+        stops = [SPLASH_STOPS[(i + offset) % len(SPLASH_STOPS)] for i in range(3)]
+        centers = [
+            (int(sw * 0.25), int(sh * 0.30)),
+            (int(sw * 0.78), int(sh * 0.40)),
+            (int(sw * 0.50), int(sh * 0.78)),
+        ]
+        max_r = max(sw, sh) * 0.7
+        for cx, cy in centers:
+            rgb = stops[centers.index((cx, cy))]
+            for y in range(sh):
+                for x in range(sw):
+                    dx = x - cx; dy = y - cy
+                    d = (dx * dx + dy * dy) ** 0.5
+                    t = max(0.0, 1.0 - d / max_r)
+                    t = t * t * 0.6
+                    r0, g0, b0 = pix[x, y]
+                    r1, g1, b1 = rgb
+                    pix[x, y] = (
+                        int(r0 + (r1 - r0) * t),
+                        int(g0 + (g1 - g0) * t),
+                        int(b0 + (b1 - b0) * t),
+                    )
+        layer = layer.resize((width, height), Image.Resampling.BILINEAR)
+        return layer.filter(ImageFilter.GaussianBlur(max(20, min(width, height) // 12)))
+    except Exception as e:
+        logger.debug(f"build_splash_gradient failed: {e}")
+        return Image.new("RGB", (width, height), (10, 10, 12))
+
+
+def render_idle_splash(window_width: int, window_height: int) -> None:
+    """Paints the idle splash: full-window mesh gradient + centered wordmark."""
+    global idle_splash_bg_id, idle_splash_bg_photo_ref, idle_splash_wordmark_id
+    if not canvas:
+        return
+    try:
+        gradient = build_splash_gradient(window_width, window_height, phase=0.0)
+        idle_splash_bg_photo_ref = ImageTk.PhotoImage(gradient)
+        if idle_splash_bg_id:
+            try:
+                canvas.itemconfigure(idle_splash_bg_id, image=idle_splash_bg_photo_ref)
+            except tk.TclError:
+                idle_splash_bg_id = None
+        if not idle_splash_bg_id:
+            idle_splash_bg_id = canvas.create_image(
+                0, 0, anchor=tk.NW,
+                image=idle_splash_bg_photo_ref,
+                tags=("idle_splash",),
+            )
+
+        wordmark_size = compute_type_scale(min(window_width, window_height))["wordmark"]
+        font_obj = (get_ui_font_family(), wordmark_size, "bold")
+        text_x = window_width / 2
+        text_y = window_height / 2
+        if idle_splash_wordmark_id:
+            try:
+                canvas.coords(idle_splash_wordmark_id, text_x, text_y)
+                canvas.itemconfigure(
+                    idle_splash_wordmark_id,
+                    text="SongPi",
+                    font=font_obj,
+                    fill="#ffffff",
+                    anchor=tk.CENTER,
+                )
+            except tk.TclError:
+                idle_splash_wordmark_id = None
+        if not idle_splash_wordmark_id:
+            idle_splash_wordmark_id = canvas.create_text(
+                text_x, text_y,
+                text="SongPi",
+                font=font_obj,
+                fill="#ffffff",
+                anchor=tk.CENTER,
+                tags=("idle_splash", "wordmark"),
+            )
+        canvas.tag_raise("idle_splash")
+        canvas.tag_raise("status_pill")
+    except tk.TclError as e:
+        logger.debug(f"render_idle_splash failed: {e}")
+
+
+def hide_idle_splash() -> None:
+    """Removes splash items if present."""
+    if not canvas:
+        return
+    try:
+        canvas.delete("idle_splash")
+    except tk.TclError:
+        pass
+    global idle_splash_bg_id, idle_splash_bg_photo_ref, idle_splash_wordmark_id
+    idle_splash_bg_id = None
+    idle_splash_bg_photo_ref = None
+    idle_splash_wordmark_id = None
 
 
 def build_cover_halo(cover_size: int, accent_hex: str, intensity: float) -> Optional[Image.Image]:
@@ -2643,6 +2758,22 @@ def update_images() -> Dict[str, Any]:
         'window_height': window_height,
         'is_fullscreen': is_fullscreen
     })
+
+    # Idle splash takeover — skip rest of layout when active.
+    global idle_splash_active
+    has_active_track = bool(last_track_title)
+    splash = should_show_idle_splash(
+        last_match_monotonic=last_recognition_monotonic,
+        now_monotonic=time.monotonic(),
+        has_active_track=has_active_track,
+        cfg=config,
+    )
+    idle_splash_active = splash
+    if splash:
+        render_idle_splash(window_width, window_height)
+        layout_info["idle_splash"] = True
+        return layout_info
+    hide_idle_splash()
 
     image_file_path = IMAGE_PATH
     gui_cfg = config['gui']
