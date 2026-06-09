@@ -795,6 +795,17 @@ def detect_layout_breakpoint(width: int, height: int) -> str:
     return "mid"
 
 
+def format_artist_label(value: str, max_chars: int = 40) -> str:
+    """Renders the artist label in uppercase. If short enough, inserts hair
+    spaces between letters to fake letter-tracking (Tk lacks letter-spacing)."""
+    if not value:
+        return ""
+    upper = value.upper()
+    if len(upper) <= max_chars:
+        return " ".join(upper)
+    return upper
+
+
 def is_low_power_host() -> bool:
     """Heuristic: Pi 3 (armv7) is the canonical low-power target. Anything
     armv7 with <=4 cores triggers the reduced-motion profile by default."""
@@ -2781,7 +2792,7 @@ def update_images() -> Dict[str, Any]:
         title_display_text = last_track_title
         album_text = last_album_name.strip()
         album_display_text = album_text
-        artist_display_text = last_artist_name
+        artist_display_text = format_artist_label(last_artist_name)
 
         title_label_id, title_font_obj, title_bbox = fit_canvas_title_font(
             canvas,

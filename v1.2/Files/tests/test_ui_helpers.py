@@ -144,3 +144,24 @@ def test_motion_disabled_on_low_power_even_if_config_false():
     cfg = {"gui": {"motion_reduced": False}}
     with patch.object(shazam, "is_low_power_host", return_value=True):
         assert shazam.is_motion_enabled(cfg) is False
+
+
+def test_format_artist_label_uppercases():
+    out = shazam.format_artist_label("Taylor Swift").replace(" ", "")
+    assert "TAYLOR" in out
+
+
+def test_format_artist_label_inserts_hair_space_when_short():
+    out = shazam.format_artist_label("ABBA")
+    # U+200A hair space between letters
+    assert " " in out
+
+
+def test_format_artist_label_skips_tracking_when_long():
+    long = "A Very Long Artist Name That Should Not Get Tracked Out For Sure"
+    out = shazam.format_artist_label(long)
+    assert " " not in out
+
+
+def test_format_artist_label_empty():
+    assert shazam.format_artist_label("") == ""
