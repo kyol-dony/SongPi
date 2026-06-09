@@ -1108,6 +1108,15 @@ def safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def responsive_clamp(min_value: float, value: float, max_value: float) -> float:
+    """CSS-style clamp(lo, val, hi). Used throughout the responsive type/spacing scale."""
+    if value < min_value:
+        return min_value
+    if value > max_value:
+        return max_value
+    return value
+
+
 def fit_canvas_title_font(
     canvas_obj: tk.Canvas,
     text_item_id: Optional[int],
