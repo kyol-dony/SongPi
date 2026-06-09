@@ -3279,9 +3279,20 @@ def update_images() -> Dict[str, Any]:
 
         render_lyrics_labels()
         render_progress_bar(window_width, window_height)
-        canvas.tag_raise("main_text")
-        canvas.tag_raise("status_pill")
-        canvas.tag_raise("progress_bar")
+        try:
+            canvas.tag_lower("background")
+            canvas.tag_raise("cover_halo", "background")
+            if coverart_item_id:
+                canvas.tag_raise(coverart_item_id, "cover_halo")
+            canvas.tag_raise("main_text")
+            canvas.tag_raise("lyrics_text")
+            canvas.tag_raise("progress_bar")
+            canvas.tag_raise("status_pill")
+            if idle_splash_active:
+                canvas.tag_raise("idle_splash")
+                canvas.tag_raise("status_pill")
+        except tk.TclError:
+            pass
     except tk.TclError as e:
         logger.warning(f"TclError updating text labels: {e}. IDs reset.")
         global status_pill_bg_id, status_pill_dot_id, progress_bar_track_id, progress_bar_fill_id
