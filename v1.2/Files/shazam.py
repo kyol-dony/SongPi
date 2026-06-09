@@ -1510,6 +1510,58 @@ def ease_out_cubic(t: float) -> float:
     return 1.0 - (1.0 - t) ** 3
 
 
+def longest_word_pixel_width(text: str, font_obj: tkFont.Font) -> int:
+    """Returns the pixel width of the widest single whitespace-delimited token
+    in `text`. Used by `fit_canvas_title_font` to prevent Tk's character-wrap
+    fallback from breaking long words mid-glyph."""
+    if not text:
+        return 0
+    try:
+        return max((font_obj.measure(w) for w in text.split()), default=0)
+    except tk.TclError:
+        return 0
+
+
+def truncate_word_to_width(word: str, font_obj: tkFont.Font, width: int) -> str:
+    """Cuts an oversized word down to `width` pixels, appending an ellipsis.
+    Last-resort fallback when even the smallest legal font can't fit the
+    longest word in the allotted column."""
+    if width <= 0 or not word:
+        return word
+    ellipsis = "…"
+    try:
+        if font_obj.measure(word) <= width:
+            return word
+        # Binary search for the longest prefix that fits.
+        lo, hi = 0, len(word)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font_obj.measure(word[:mid] + ellipsis) <= width:
+                lo = mid
+            else:
+                hi = mid - 1
+        return word[:lo] + ellipsis if lo > 0 else ellipsis
+    except tk.TclError:
+        return word
+
+
+def ensure_words_fit(text: str, font_obj: tkFont.Font, width: int) -> str:
+    """Replaces any word too wide to fit the wrap column with a truncated
+    variant. Preserves whitespace runs (newlines, multiple spaces collapse
+    to single spaces because Tk wraps on whitespace anyway)."""
+    if not text or width <= 0:
+        return text
+    out_tokens: List[str] = []
+    for word in text.split():
+        try:
+            if font_obj.measure(word) > width:
+                word = truncate_word_to_width(word, font_obj, width)
+        except tk.TclError:
+            pass
+        out_tokens.append(word)
+    return " ".join(out_tokens)
+
+
 def fit_canvas_title_font(
     canvas_obj: tk.Canvas,
     text_item_id: Optional[int],
@@ -1528,7 +1580,10 @@ def fit_canvas_title_font(
     slant: str = "roman",
     tags: Tuple[str, ...] = ("main_text",),
 ) -> Tuple[int, tkFont.Font, Tuple[int, int, int, int]]:
-    """Shrinks the current-song title font until its wrapped height fits the allotted block."""
+    """Shrinks the font until the wrapped text fits both the height budget and
+    no single word overflows the wrap column. Long words trigger an additional
+    size shrink so Tk never falls back to mid-glyph character wrap. As a final
+    fallback at `min_size`, overlong words are ellipsized."""
     if family is None:
         family = get_ui_font_family()
     font_size = max(min_size, base_size)
@@ -1539,11 +1594,21 @@ def fit_canvas_title_font(
 
     while font_size >= min_size:
         font_obj = tkFont.Font(family=family, size=font_size, weight=weight, slant=slant)
+
+        render_text = text
+        # If the longest word doesn't fit at this size, shrink further. Only when
+        # we're already at min_size do we accept the size and ellipsize the word.
+        if width > 0 and longest_word_pixel_width(text, font_obj) > width:
+            if font_size > min_size:
+                font_size -= 1
+                continue
+            render_text = ensure_words_fit(text, font_obj, width)
+
         if item_id:
             canvas_obj.coords(item_id, x_pos, y_pos)
             canvas_obj.itemconfigure(
                 item_id,
-                text=text,
+                text=render_text,
                 font=font_obj,
                 fill=fill,
                 anchor=anchor,
@@ -1555,7 +1620,7 @@ def fit_canvas_title_font(
             item_id = canvas_obj.create_text(
                 x_pos,
                 y_pos,
-                text=text,
+                text=render_text,
                 font=font_obj,
                 fill=fill,
                 anchor=anchor,
@@ -3236,35 +3301,74 @@ def update_images() -> Dict[str, Any]:
             title_max_height,
         )
         title_block_bottom = title_bbox[3]
-        title_to_album_gap = 8 if cinematic_mode else max(4, int(album_line_height * 0.35))
-        album_to_artist_gap = 8 if cinematic_mode else max(4, int(artist_line_height * 0.2))
-        artist_to_status_gap = 12 if cinematic_mode else max(6, int(status_line_height * 0.45))
 
+        # Spacing between meta lines, scaled to the actual rendered font heights.
+        # Gap is a proportion of the *next* line's height so it feels balanced
+        # whether the title wrapped or not.
+        title_to_album_gap = max(6, int(album_line_height * 0.45))
+        album_to_artist_gap = max(6, int(artist_line_height * 0.35))
+        artist_to_status_gap = max(10, int(status_line_height * 0.7))
+
+        # Render album using fit_canvas_title_font so we get word-fit protection
+        # and a true bbox; stack the next line from that bbox bottom.
+        album_min_size = max(8, int(album_font_obj.cget("size") if hasattr(album_font_obj, 'cget') else max(10, int(artist_font_size * 0.85))) - 1)
+        album_max_height = max(album_line_height * 3, int(metadata_width * 0.4))
         album_y = title_block_bottom + title_to_album_gap
         if album_text:
-            artist_y = album_y + album_line_height + album_to_artist_gap
+            album_label_id, _, album_bbox = fit_canvas_title_font(
+                canvas,
+                album_label_id,
+                album_display_text,
+                main_text_x,
+                album_y,
+                metadata_width,
+                secondary_text_color,
+                metadata_anchor,
+                metadata_justify,
+                max(10, int(artist_font_size * 0.95)),
+                album_min_size,
+                album_max_height,
+                weight="normal",
+                slant="italic",
+            )
+            album_block_bottom = album_bbox[3]
         else:
-            artist_y = title_block_bottom + title_to_album_gap
-        status_y = artist_y + artist_line_height + artist_to_status_gap
+            # Hide the album label (empty text, zero height) when no album.
+            if album_label_id:
+                try:
+                    canvas.itemconfigure(album_label_id, text="")
+                except tk.TclError:
+                    album_label_id = None
+            album_block_bottom = title_block_bottom
+
+        artist_y = album_block_bottom + album_to_artist_gap
+        artist_min_size = max(8, int(artist_font_size * 0.7))
+        artist_max_height = max(artist_line_height * 3, int(metadata_width * 0.5))
+        artist_label_id, _, artist_bbox = fit_canvas_title_font(
+            canvas,
+            artist_label_id,
+            artist_display_text,
+            main_text_x,
+            artist_y,
+            metadata_width,
+            secondary_text_color,
+            metadata_anchor,
+            metadata_justify,
+            artist_font_size,
+            artist_min_size,
+            artist_max_height,
+            weight="normal",
+        )
+        artist_block_bottom = artist_bbox[3]
+        status_y = artist_block_bottom + artist_to_status_gap
 
         layout_info.update({
             'title_y': title_y,
             'album_y': album_y,
             'artist_y': artist_y,
             'status_y': status_y,
+            'meta_block_bottom': status_y,
         })
-
-        if album_label_id:
-            canvas.coords(album_label_id, main_text_x, album_y)
-            canvas.itemconfigure(album_label_id, text=album_display_text, font=album_font_obj, fill=secondary_text_color, anchor=metadata_anchor, justify=metadata_justify, width=metadata_width)
-        else:
-            album_label_id = canvas.create_text(main_text_x, album_y, text=album_display_text, font=album_font_obj, tags=("main_text",), fill=secondary_text_color, anchor=metadata_anchor, justify=metadata_justify, width=metadata_width)
-
-        if artist_label_id:
-            canvas.coords(artist_label_id, main_text_x, artist_y)
-            canvas.itemconfigure(artist_label_id, text=artist_display_text, font=artist_font_obj, fill=secondary_text_color, anchor=metadata_anchor, justify=metadata_justify, width=metadata_width)
-        else:
-            artist_label_id = canvas.create_text(main_text_x, artist_y, text=artist_display_text, font=artist_font_obj, tags=("main_text",), fill=secondary_text_color, anchor=metadata_anchor, justify=metadata_justify, width=metadata_width)
 
         # Status now renders as a pill (rounded surface + animated dot + label)
         # anchored at the same status_y position, instead of plain canvas text.
@@ -3276,6 +3380,22 @@ def update_images() -> Dict[str, Any]:
         )
 
         canvas.delete("metadata_icon")
+
+        # In stacked layout the meta block sits between the cover and lyrics —
+        # if title/album/artist grew taller than expected, push the lyrics
+        # column down so it never overlaps the metadata. In cinematic mode the
+        # two columns are side-by-side, but we still apply a soft floor so a
+        # very wrapped left column can't intrude on the right side's vertical
+        # band.
+        meta_block_bottom_px = layout_info.get("meta_block_bottom", status_y) + status_line_height
+        # Status pill adds a rounded surface that extends slightly below the
+        # label baseline — reserve that here too.
+        meta_block_bottom_px += max(8, int(status_font_size * 0.6))
+        if not cinematic_mode:
+            lyric_gap = max(20, int(window_height * 0.025))
+            new_primary_y = meta_block_bottom_px + lyric_gap
+            if new_primary_y > lyrics_layout_cache.get("primary_y", 0):
+                lyrics_layout_cache["primary_y"] = new_primary_y
 
         render_lyrics_labels()
         render_progress_bar(window_width, window_height)

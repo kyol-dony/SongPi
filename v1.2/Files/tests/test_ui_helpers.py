@@ -233,3 +233,44 @@ def test_status_state_ready():
 
 def test_status_state_default_falls_to_idle():
     assert shazam.classify_status_state("") == "idle"
+
+
+class _FakeFont:
+    """Minimal stand-in for tkFont.Font.measure that doesn't need a Tk root."""
+    def __init__(self, char_px: int = 8):
+        self.char_px = char_px
+
+    def measure(self, text: str) -> int:
+        return len(text) * self.char_px
+
+
+def test_longest_word_pixel_width_picks_widest():
+    font = _FakeFont(char_px=10)
+    assert shazam.longest_word_pixel_width("Supercalifragilistic a b", font) == 200
+
+
+def test_longest_word_pixel_width_empty():
+    assert shazam.longest_word_pixel_width("", _FakeFont()) == 0
+
+
+def test_truncate_word_to_width_no_op_when_fits():
+    assert shazam.truncate_word_to_width("Hi", _FakeFont(char_px=10), 100) == "Hi"
+
+
+def test_truncate_word_to_width_ellipsizes_overlong():
+    out = shazam.truncate_word_to_width("Supercalifragilistic", _FakeFont(char_px=10), 100)
+    assert out.endswith("…")
+    assert len(out) < len("Supercalifragilistic")
+
+
+def test_ensure_words_fit_keeps_short_words():
+    out = shazam.ensure_words_fit("hello world", _FakeFont(char_px=10), 200)
+    assert out == "hello world"
+
+
+def test_ensure_words_fit_ellipsizes_one_long_word():
+    out = shazam.ensure_words_fit("hello Supercalifragilistic world", _FakeFont(char_px=10), 100)
+    assert "hello" in out
+    assert "world" in out
+    assert "Supercalifragilistic" not in out
+    assert "…" in out
