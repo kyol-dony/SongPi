@@ -150,12 +150,18 @@ def load_config() -> Dict[str, Any]:
             "status_font_size_ratio": 0.8, # Base ratio before halving
             "history_max_items_retain": 20, # Max items to keep images for on disk
             "vignette_intensity": 0.55,
+            "ken_burns_enabled": True,
+            "motion_reduced": False,
+            "idle_splash_enabled": True,
+            "idle_splash_after_seconds": 10,
+            "accent_halo_intensity": 0.35,
         },
         "network": {"timeout": 7, "retry_count": 3, "retry_delay": 2},
         "lyrics": {
             "enabled": True,
             "show_plain_lyrics": False,
             "prefer_synced_lyrics": True,
+            "lines_visible": 3,
             "force_cinematic_mode": True,
             "fullscreen_implies_cinematic_mode": True,
             "refresh_interval_ms": 250,

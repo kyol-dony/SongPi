@@ -28,7 +28,13 @@
         "layout_side_min_buffer": 50,
         "layout_below_min_buffer": 50,
         "status_font_size_ratio": 0.8,
-        "history_max_items_retain": 20
+        "history_max_items_retain": 20,
+        "vignette_intensity": 0.55,
+        "ken_burns_enabled": true,
+        "motion_reduced": false,
+        "idle_splash_enabled": true,
+        "idle_splash_after_seconds": 10,
+        "accent_halo_intensity": 0.35
     },
     "network": {
         "timeout": 5,
@@ -39,6 +45,7 @@
         "enabled": true,
         "show_plain_lyrics": false,
         "prefer_synced_lyrics": true,
+        "lines_visible": 3,
         "force_cinematic_mode": false,
         "fullscreen_implies_cinematic_mode": true,
         "refresh_interval_ms": 50,
