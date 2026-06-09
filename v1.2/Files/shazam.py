@@ -96,6 +96,14 @@ lyric_transition_state: Dict[str, Any] = {
 
 last_recognition_monotonic: float = 0.0   # Updated when a match resolves.
 
+track_change_state: Dict[str, Any] = {
+    "active": False,
+    "start_monotonic": 0.0,
+    "duration": 0.3,
+    "previous_accent": "#7c8fff",
+}
+track_change_job_id: Optional[str] = None
+
 idle_splash_active: bool = False
 idle_splash_bg_id: Optional[int] = None
 idle_splash_bg_photo_ref: Optional["ImageTk.PhotoImage"] = None
@@ -2552,6 +2560,50 @@ def tick_lyric_glow():
         lyric_glow_job_id = None
 
 
+def begin_track_change_choreography(previous_accent: str) -> None:
+    """Kicks off the 300ms color/meta crossfade after a different-track recognition."""
+    if not is_motion_enabled(config):
+        return
+    track_change_state["active"] = True
+    track_change_state["start_monotonic"] = time.monotonic()
+    track_change_state["previous_accent"] = previous_accent or "#7c8fff"
+    if root and root.winfo_exists():
+        try:
+            root.after(16, tick_track_change_choreography)
+        except tk.TclError:
+            pass
+
+
+def tick_track_change_choreography():
+    """Per-frame interpolation of accent color across UI elements during a track change."""
+    global track_change_job_id
+    track_change_job_id = None
+    if not track_change_state.get("active") or not canvas:
+        return
+    elapsed = time.monotonic() - track_change_state["start_monotonic"]
+    duration = track_change_state["duration"]
+    if elapsed >= duration:
+        track_change_state["active"] = False
+        return
+    t = ease_out_cubic(elapsed / duration)
+    prev_rgb = hex_to_rgb(track_change_state["previous_accent"])
+    new_rgb = hex_to_rgb(accent_color_hex)
+    blended = rgb_to_hex(mix_rgb(prev_rgb, new_rgb, t))
+    try:
+        if progress_bar_fill_id:
+            canvas.itemconfigure(progress_bar_fill_id, fill=blended)
+        if status_pill_dot_id and classify_status_state(current_status_message) in ("listening", "recognizing", "starting"):
+            canvas.itemconfigure(status_pill_dot_id, fill=blended)
+    except tk.TclError:
+        track_change_state["active"] = False
+        return
+    if root and root.winfo_exists():
+        try:
+            track_change_job_id = root.after(16, tick_track_change_choreography)
+        except tk.TclError:
+            track_change_job_id = None
+
+
 def tick_lyric_transition():
     """Applies the per-frame fade-in for a freshly-advanced lyric line.
 
@@ -3757,6 +3809,8 @@ async def process_recognition_result(
     """Processes successful Shazam result: cache/download image, add to history, save state."""
     global song_history_list, last_recognition_monotonic
     last_recognition_monotonic = time.monotonic()
+    previous_track_key = build_track_key(last_track_title, last_artist_name) if last_track_title else None
+    previous_accent = accent_color_hex
     track_info = result.get('track', {})
     new_title = track_info.get('title', 'Unknown Title')
     new_artist = track_info.get('subtitle', 'Unknown Artist')
@@ -3892,6 +3946,9 @@ async def process_recognition_result(
     path_to_save = persistent_path_for_this_song if cache_hit else final_persistent_path
     save_last_state(new_title, new_artist, new_album, path_to_save)
     prepare_lyrics_for_track(result, new_title, new_artist, record_start_monotonic)
+    new_track_key = build_track_key(new_title, new_artist)
+    if previous_track_key and new_track_key != previous_track_key:
+        schedule_gui_update(begin_track_change_choreography, previous_accent)
 
     return {
         'status': 'success',
