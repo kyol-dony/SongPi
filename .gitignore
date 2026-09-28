@@ -35,6 +35,16 @@ docs/
 
 # Graphify generated knowledge graph
 graphify-out/
+**/graphify-out/
+.graphify/
+**/.graphify/
+.graphify_analysis.json
+.graphify_labels.json
+.graphify_python
+
+# GSD planning workspace
+.planning/
+**/.planning/
 
 # OS cruft
 .DS_Store
