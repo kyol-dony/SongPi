@@ -138,6 +138,11 @@ class LedController:
         self._flush_timer = None
         self._pending_commands = []
         self._ready_at = 0.0
+        # A queued command may have been cached as delivered before the Uno
+        # became ready. Clear delivery caches whenever the transport fails or
+        # closes so the next redraw/state change reconnects and resends.
+        self._last_color = None
+        self._last_state = None
         if self._serial:
             try:
                 self._serial.close()

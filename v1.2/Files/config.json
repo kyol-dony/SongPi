@@ -42,8 +42,8 @@
         "retry_delay": 2
     },
     "led": {
-        "enabled": true,
-        "port": "/dev/cu.usbmodem11101",
+        "enabled": false,
+        "port": "",
         "baud_rate": 115200,
         "brightness": 46,
         "pixel_count": 30,

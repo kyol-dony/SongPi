@@ -1038,7 +1038,9 @@ def render_cover_halo(square_x: float, square_y: float, square_size: int) -> Non
             square_x, square_y,
             anchor=tk.CENTER,
             image=cover_halo_photo_ref,
-            tags=("background", "cover_halo"),
+            # Keep the halo out of the broad background tag: backdrop refreshes
+            # delete that tag, while the halo has its own lifecycle and ID.
+            tags=("cover_halo",),
         )
     try:
         canvas.tag_raise("cover_halo", "background")
@@ -1095,6 +1097,27 @@ def detect_layout_breakpoint(width: int, height: int) -> str:
     return "mid"
 
 
+def should_use_cinematic_mode(width: int, height: int, is_fullscreen: bool,
+                              lyrics_cfg: Dict[str, Any]) -> bool:
+    """Resolve whether the split/compact cinematic layout is safe to render.
+
+    Fullscreen alone must not force overlapping columns on a narrow display;
+    the geometry breakpoint remains authoritative unless explicitly forced.
+    """
+    if not bool(lyrics_cfg.get("enabled", True)):
+        return False
+    if bool(lyrics_cfg.get("force_cinematic_mode", False)):
+        return True
+    breakpoint = detect_layout_breakpoint(width, height)
+    if breakpoint == "stacked":
+        return False
+    fullscreen_requested = (
+        bool(lyrics_cfg.get("fullscreen_implies_cinematic_mode", True))
+        and bool(is_fullscreen)
+    )
+    return breakpoint in ("wide", "mid") or fullscreen_requested
+
+
 def format_artist_label(value: str, max_chars: int = 40) -> str:
     """Renders the artist label in uppercase. If short enough, inserts hair
     spaces between letters to fake letter-tracking (Tk lacks letter-spacing)."""
@@ -1133,6 +1156,15 @@ def should_show_idle_splash(last_match_monotonic: float, now_monotonic: float,
         return False
     threshold = safe_float(gui_cfg.get("idle_splash_after_seconds")) or 10.0
     return (now_monotonic - last_match_monotonic) >= threshold
+
+
+def has_recent_track(last_match_monotonic: float, now_monotonic: float,
+                     cfg: Dict[str, Any]) -> bool:
+    """True only while a successful recognition is recent enough to be active."""
+    if last_match_monotonic <= 0.0:
+        return False
+    threshold = safe_float(cfg.get("gui", {}).get("idle_splash_after_seconds")) or 10.0
+    return (now_monotonic - last_match_monotonic) < threshold
 
 
 def compute_type_scale(short_edge: int) -> Dict[str, int]:
@@ -2618,6 +2650,17 @@ def classify_status_state(message: str) -> str:
     return "idle"
 
 
+def status_dot_color(state: str) -> str:
+    """Return the static dot color for a classified status state."""
+    if state in ("listening", "recognizing", "starting"):
+        return accent_color_hex
+    if state == "error":
+        return "#dc2626"
+    if state == "no_match":
+        return "#8b919c"
+    return "#5b6270"
+
+
 def render_status_pill(text_x: float, text_y: float, anchor: str, font_size: int) -> None:
     """Draws the status row as a rounded pill (dot + label).
 
@@ -2675,14 +2718,7 @@ def render_status_pill(text_x: float, text_y: float, anchor: str, font_size: int
 
     # Dot color is driven by classified state.
     state = classify_status_state(label_text)
-    if state in ("listening", "recognizing", "starting"):
-        dot_color = accent_color_hex
-    elif state == "error":
-        dot_color = "#dc2626"
-    elif state == "no_match":
-        dot_color = "#8b919c"
-    else:
-        dot_color = "#5b6270"
+    dot_color = status_dot_color(state)
     dot_cx = x1 + pad_x + dot_radius
     dot_cy = (y1 + y2) / 2
     if status_pill_dot_id:
@@ -2748,7 +2784,7 @@ def tick_status_pulse():
                 rgb = mix_rgb(dim_rgb, accent_rgb, pulse)
                 canvas.itemconfigure(status_pill_dot_id, fill=rgb_to_hex(rgb))
             else:
-                canvas.itemconfigure(status_pill_dot_id, fill="#5b6270")
+                canvas.itemconfigure(status_pill_dot_id, fill=status_dot_color(state))
     except tk.TclError:
         pass
 
@@ -3071,10 +3107,18 @@ def update_images() -> Dict[str, Any]:
 
     # Idle splash takeover — skip rest of layout when active.
     global idle_splash_active
-    has_active_track = bool(last_track_title)
+    now_monotonic = time.monotonic()
+    # A persisted title is display state, not proof that music is still active.
+    # Repeated successful recognitions keep this recent; no-match cycles let it
+    # expire so the idle splash can return after playback stops.
+    has_active_track = bool(last_track_title) and has_recent_track(
+        last_recognition_monotonic,
+        now_monotonic,
+        config,
+    )
     splash = should_show_idle_splash(
         last_match_monotonic=last_recognition_monotonic,
-        now_monotonic=time.monotonic(),
+        now_monotonic=now_monotonic,
         has_active_track=has_active_track,
         cfg=config,
     )
@@ -3164,13 +3208,14 @@ def update_images() -> Dict[str, Any]:
     panel_gap_ratio = safe_float(lyrics_cfg.get("panel_gap_ratio")) or 0.04
     outer_margin = max(20, int(min(window_width, window_height) * margin_ratio))
     panel_gap = max(16, int(window_width * panel_gap_ratio))
-    force_cinematic_mode = bool(lyrics_cfg.get("force_cinematic_mode", False))
-    fullscreen_implies_cinematic = bool(lyrics_cfg.get("fullscreen_implies_cinematic_mode", True))
-    cinematic_mode = bool(lyrics_cfg.get("enabled", True)) and (
-        force_cinematic_mode
-        or (fullscreen_implies_cinematic and bool(is_fullscreen))
-        or window_width >= int(window_height * 1.18)
+    layout_breakpoint = detect_layout_breakpoint(window_width, window_height)
+    cinematic_mode = should_use_cinematic_mode(
+        window_width,
+        window_height,
+        bool(is_fullscreen),
+        lyrics_cfg,
     )
+    layout_info['layout_breakpoint'] = layout_breakpoint
     layout_info['cinematic_mode'] = cinematic_mode
 
     if cinematic_mode:
@@ -3928,6 +3973,9 @@ def update_gui(update_data: Dict[str, Any]):
     elif status == 'no_match':
         logger.info("GUI update: No match found.")
         status_to_set = "No Match Found"
+        # Re-evaluate idle timing on every no-match cycle so a persisted title
+        # cannot prevent the splash from returning after playback stops.
+        redraw_needed = True
 
     elif status == 'error':
         logger.error(f"GUI update: Received error status. Message: '{error_message}'")

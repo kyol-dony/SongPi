@@ -107,6 +107,31 @@ def test_extract_dominant_color_returns_black_when_nothing_else_available():
     assert shazam.hex_to_rgb(shazam.extract_dominant_color(img)) == (5, 5, 5)
 
 
+def test_cover_halo_uses_its_own_canvas_tag(monkeypatch):
+    class FakeCanvas:
+        def __init__(self):
+            self.created_tags = None
+
+        def create_image(self, *args, **kwargs):
+            self.created_tags = kwargs.get("tags")
+            return 42
+
+        def tag_raise(self, *args):
+            pass
+
+    fake_canvas = FakeCanvas()
+    monkeypatch.setattr(shazam, "canvas", fake_canvas)
+    monkeypatch.setattr(shazam, "cover_halo_item_id", None)
+    monkeypatch.setattr(shazam, "cover_halo_photo_ref", None)
+    monkeypatch.setattr(shazam, "config", {"gui": {"accent_halo_intensity": 0.35}})
+    monkeypatch.setattr(shazam, "build_cover_halo", lambda *args: object())
+    monkeypatch.setattr(shazam.ImageTk, "PhotoImage", lambda image: object())
+
+    shazam.render_cover_halo(100, 100, 80)
+
+    assert fake_canvas.created_tags == ("cover_halo",)
+
+
 def test_breakpoint_wide_at_1920x1080():
     assert shazam.detect_layout_breakpoint(1920, 1080) == "wide"
 
@@ -126,6 +151,18 @@ def test_breakpoint_mid_at_1024x900():
 
 def test_breakpoint_handles_zero_height():
     assert shazam.detect_layout_breakpoint(800, 0) == "stacked"
+
+
+def test_default_window_uses_stacked_layout_even_at_landscape_aspect():
+    cfg = {"enabled": True, "force_cinematic_mode": False,
+           "fullscreen_implies_cinematic_mode": True}
+    assert shazam.should_use_cinematic_mode(800, 600, False, cfg) is False
+
+
+def test_mid_breakpoint_uses_compact_cinematic_layout():
+    cfg = {"enabled": True, "force_cinematic_mode": False,
+           "fullscreen_implies_cinematic_mode": True}
+    assert shazam.should_use_cinematic_mode(1024, 900, False, cfg) is True
 
 
 def test_type_scale_at_1080_short_edge():
@@ -244,6 +281,16 @@ def test_should_not_show_idle_splash_within_threshold():
     ) is False
 
 
+def test_persisted_track_is_not_recent_after_idle_threshold():
+    cfg = {"gui": {"idle_splash_after_seconds": 10}}
+    assert shazam.has_recent_track(80.0, 100.0, cfg) is False
+
+
+def test_successful_match_is_recent_within_idle_threshold():
+    cfg = {"gui": {"idle_splash_after_seconds": 10}}
+    assert shazam.has_recent_track(95.0, 100.0, cfg) is True
+
+
 def test_status_state_listening():
     assert shazam.classify_status_state("Listening...") == "listening"
 
@@ -270,6 +317,11 @@ def test_status_state_ready():
 
 def test_status_state_default_falls_to_idle():
     assert shazam.classify_status_state("") == "idle"
+
+
+def test_status_dot_color_preserves_error_and_no_match_states():
+    assert shazam.status_dot_color("error") == "#dc2626"
+    assert shazam.status_dot_color("no_match") == "#8b919c"
 
 
 class _FakeFont:

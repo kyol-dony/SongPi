@@ -24,3 +24,16 @@ def test_controller_clamps_brightness():
 
 def test_controller_defaults_to_uno_reset_delay():
     assert LedController().reset_delay_seconds == 2.0
+
+
+def test_transport_failure_clears_queued_color_cache():
+    controller = LedController({"enabled": True, "port": "test"})
+    controller._last_color = (12, 34, 56)
+    controller._last_state = "ready"
+    controller._pending_commands = ["COLOR 12 34 56"]
+
+    controller._close_unlocked()
+
+    assert controller._last_color is None
+    assert controller._last_state is None
+    assert controller._pending_commands == []
