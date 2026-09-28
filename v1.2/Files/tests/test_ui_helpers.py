@@ -1,0 +1,365 @@
+"""Tests for pure UI helpers in shazam.py (no Tk required)."""
+import importlib
+import sys
+import types
+from unittest.mock import patch
+
+# Stub out modules shazam.py imports that require native libs.
+for mod_name in ("pyaudio", "screeninfo", "shazamio"):
+    sys.modules.setdefault(mod_name, types.ModuleType(mod_name))
+sys.modules["pyaudio"].PyAudio = type("PyAudio", (), {})
+sys.modules["pyaudio"].paInt16 = 8
+sys.modules["pyaudio"].paInputOverflowed = -9981
+sys.modules["screeninfo"].get_monitors = lambda: []
+sys.modules["shazamio"].Shazam = type("Shazam", (), {})
+
+shazam = importlib.import_module("shazam")
+
+
+def test_responsive_clamp_returns_value_when_in_range():
+    assert shazam.responsive_clamp(10, 25, 40) == 25
+
+
+def test_responsive_clamp_clamps_low():
+    assert shazam.responsive_clamp(10, 5, 40) == 10
+
+
+def test_responsive_clamp_clamps_high():
+    assert shazam.responsive_clamp(10, 100, 40) == 40
+
+
+def test_responsive_clamp_handles_float():
+    assert shazam.responsive_clamp(0.0, 1.5, 2.0) == 1.5
+
+
+def test_ease_out_cubic_starts_at_zero():
+    assert shazam.ease_out_cubic(0.0) == 0.0
+
+
+def test_ease_out_cubic_ends_at_one():
+    assert shazam.ease_out_cubic(1.0) == 1.0
+
+
+def test_ease_out_cubic_is_above_linear_in_middle():
+    assert shazam.ease_out_cubic(0.5) > 0.5
+
+
+def test_ease_out_cubic_clamps_input():
+    assert shazam.ease_out_cubic(-0.5) == 0.0
+    assert shazam.ease_out_cubic(2.0) == 1.0
+
+
+def test_dim_hex_full_amount_returns_black():
+    assert shazam.dim_hex("#ffffff", 1.0) == "#000000"
+
+
+def test_dim_hex_zero_amount_unchanged():
+    assert shazam.dim_hex("#ff8000", 0.0) == "#ff8000"
+
+
+def test_dim_hex_half_amount():
+    assert shazam.dim_hex("#ff0000", 0.5) == "#7f0000"
+
+
+def test_simulate_alpha_on_dark_full_opacity_unchanged():
+    assert shazam.simulate_alpha_on_dark("#ffffff", 1.0) == "#ffffff"
+
+
+def test_simulate_alpha_on_dark_low_opacity_blends_to_scrim():
+    result = shazam.simulate_alpha_on_dark("#ffffff", 0.0)
+    assert result == "#0a0a0c"
+
+
+def test_tune_led_color_increases_saturation_without_changing_hue_family():
+    tuned = shazam.tune_led_color("#c08080", saturation_multiplier=1.5)
+    red, green, blue = shazam.hex_to_rgb(tuned)
+    assert red > green == blue
+    assert green < 128
+
+
+def test_tune_led_color_leaves_gray_untinted():
+    assert shazam.tune_led_color("#808080", saturation_multiplier=2.0) == "#808080"
+
+
+def _solid_with_patch(bg_rgb, patch_rgb, patch_box=(90, 90, 110, 110), size=(200, 200)):
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", size, bg_rgb)
+    ImageDraw.Draw(img).rectangle(patch_box, fill=patch_rgb)
+    return img
+
+
+def test_extract_dominant_color_picks_majority_over_vivid_minority():
+    # Near-white background (96%) with a small vivid green patch (4%).
+    img = _solid_with_patch((245, 245, 240), (0, 150, 80))
+    assert shazam.hex_to_rgb(shazam.extract_dominant_color(img)) == (245, 245, 240)
+
+
+def test_extract_dominant_color_skips_black_for_next_most_used_color():
+    # Black background (96%) should fall through to the red patch (4%)
+    # rather than turning the LED strip off.
+    img = _solid_with_patch((10, 10, 10), (220, 20, 20))
+    assert shazam.hex_to_rgb(shazam.extract_dominant_color(img)) == (220, 20, 20)
+
+
+def test_extract_dominant_color_returns_black_when_nothing_else_available():
+    from PIL import Image
+    img = Image.new("RGB", (200, 200), (5, 5, 5))
+    assert shazam.hex_to_rgb(shazam.extract_dominant_color(img)) == (5, 5, 5)
+
+
+def test_cover_halo_uses_its_own_canvas_tag(monkeypatch):
+    class FakeCanvas:
+        def __init__(self):
+            self.created_tags = None
+
+        def create_image(self, *args, **kwargs):
+            self.created_tags = kwargs.get("tags")
+            return 42
+
+        def tag_raise(self, *args):
+            pass
+
+    fake_canvas = FakeCanvas()
+    monkeypatch.setattr(shazam, "canvas", fake_canvas)
+    monkeypatch.setattr(shazam, "cover_halo_item_id", None)
+    monkeypatch.setattr(shazam, "cover_halo_photo_ref", None)
+    monkeypatch.setattr(shazam, "config", {"gui": {"accent_halo_intensity": 0.35}})
+    monkeypatch.setattr(shazam, "build_cover_halo", lambda *args: object())
+    monkeypatch.setattr(shazam.ImageTk, "PhotoImage", lambda image: object())
+
+    shazam.render_cover_halo(100, 100, 80)
+
+    assert fake_canvas.created_tags == ("cover_halo",)
+
+
+def test_breakpoint_wide_at_1920x1080():
+    assert shazam.detect_layout_breakpoint(1920, 1080) == "wide"
+
+
+def test_breakpoint_stacked_at_400x800():
+    assert shazam.detect_layout_breakpoint(400, 800) == "stacked"
+
+
+def test_breakpoint_stacked_when_narrower_than_900():
+    assert shazam.detect_layout_breakpoint(800, 1200) == "stacked"
+
+
+def test_breakpoint_mid_at_1024x900():
+    # width >= 900 satisfies wide-width, but aspect 1.137 < 1.2 -> mid.
+    assert shazam.detect_layout_breakpoint(1024, 900) == "mid"
+
+
+def test_breakpoint_handles_zero_height():
+    assert shazam.detect_layout_breakpoint(800, 0) == "stacked"
+
+
+def test_default_window_uses_stacked_layout_even_at_landscape_aspect():
+    cfg = {"enabled": True, "force_cinematic_mode": False,
+           "fullscreen_implies_cinematic_mode": True}
+    assert shazam.should_use_cinematic_mode(800, 600, False, cfg) is False
+
+
+def test_mid_breakpoint_uses_compact_cinematic_layout():
+    cfg = {"enabled": True, "force_cinematic_mode": False,
+           "fullscreen_implies_cinematic_mode": True}
+    assert shazam.should_use_cinematic_mode(1024, 900, False, cfg) is True
+
+
+def test_type_scale_at_1080_short_edge():
+    scale = shazam.compute_type_scale(1080)
+    assert scale["title"] == int(shazam.responsive_clamp(18, int(1080 * 0.035), 38))
+    assert scale["lyric_active"] == int(shazam.responsive_clamp(22, int(1080 * 0.052), 64))
+    assert scale["lyric_context"] == int(shazam.responsive_clamp(13, int(1080 * 0.025), 24))
+
+
+def test_type_scale_clamps_at_small_size():
+    scale = shazam.compute_type_scale(200)
+    assert scale["title"] == 18
+    assert scale["lyric_active"] == 22
+
+
+def test_type_scale_clamps_at_large_size():
+    scale = shazam.compute_type_scale(4000)
+    assert scale["title"] == 38
+    assert scale["lyric_active"] == 64
+
+
+def test_low_power_true_for_armv7():
+    with patch("platform.machine", return_value="armv7l"), \
+         patch("os.cpu_count", return_value=4):
+        assert shazam.is_low_power_host() is True
+
+
+def test_low_power_false_for_aarch64():
+    with patch("platform.machine", return_value="aarch64"), \
+         patch("os.cpu_count", return_value=4):
+        assert shazam.is_low_power_host() is False
+
+
+def test_low_power_false_for_x86_64():
+    with patch("platform.machine", return_value="x86_64"), \
+         patch("os.cpu_count", return_value=8):
+        assert shazam.is_low_power_host() is False
+
+
+def test_motion_enabled_when_config_false_and_high_power():
+    cfg = {"gui": {"motion_reduced": False}}
+    with patch.object(shazam, "is_low_power_host", return_value=False):
+        assert shazam.is_motion_enabled(cfg) is True
+
+
+def test_motion_disabled_when_config_true():
+    cfg = {"gui": {"motion_reduced": True}}
+    with patch.object(shazam, "is_low_power_host", return_value=False):
+        assert shazam.is_motion_enabled(cfg) is False
+
+
+def test_motion_disabled_on_low_power_even_if_config_false():
+    cfg = {"gui": {"motion_reduced": False}}
+    with patch.object(shazam, "is_low_power_host", return_value=True):
+        assert shazam.is_motion_enabled(cfg) is False
+
+
+def test_format_artist_label_uppercases():
+    out = shazam.format_artist_label("Taylor Swift").replace(" ", "")
+    assert "TAYLOR" in out
+
+
+def test_format_artist_label_inserts_hair_space_when_short():
+    out = shazam.format_artist_label("ABBA")
+    # U+200A hair space between letters
+    assert " " in out
+
+
+def test_format_artist_label_skips_tracking_when_long():
+    long = "A Very Long Artist Name That Should Not Get Tracked Out For Sure"
+    out = shazam.format_artist_label(long)
+    assert " " not in out
+
+
+def test_format_artist_label_empty():
+    assert shazam.format_artist_label("") == ""
+
+
+def test_should_show_idle_splash_when_no_recent_match():
+    cfg = {"gui": {"idle_splash_enabled": True, "idle_splash_after_seconds": 10}}
+    assert shazam.should_show_idle_splash(
+        last_match_monotonic=0.0,
+        now_monotonic=100.0,
+        has_active_track=False,
+        cfg=cfg,
+    ) is True
+
+
+def test_should_not_show_idle_splash_when_track_active():
+    cfg = {"gui": {"idle_splash_enabled": True, "idle_splash_after_seconds": 10}}
+    assert shazam.should_show_idle_splash(
+        last_match_monotonic=0.0,
+        now_monotonic=100.0,
+        has_active_track=True,
+        cfg=cfg,
+    ) is False
+
+
+def test_should_not_show_idle_splash_when_disabled():
+    cfg = {"gui": {"idle_splash_enabled": False, "idle_splash_after_seconds": 10}}
+    assert shazam.should_show_idle_splash(
+        last_match_monotonic=0.0,
+        now_monotonic=100.0,
+        has_active_track=False,
+        cfg=cfg,
+    ) is False
+
+
+def test_should_not_show_idle_splash_within_threshold():
+    cfg = {"gui": {"idle_splash_enabled": True, "idle_splash_after_seconds": 10}}
+    assert shazam.should_show_idle_splash(
+        last_match_monotonic=95.0,
+        now_monotonic=100.0,
+        has_active_track=False,
+        cfg=cfg,
+    ) is False
+
+
+def test_persisted_track_is_not_recent_after_idle_threshold():
+    cfg = {"gui": {"idle_splash_after_seconds": 10}}
+    assert shazam.has_recent_track(80.0, 100.0, cfg) is False
+
+
+def test_successful_match_is_recent_within_idle_threshold():
+    cfg = {"gui": {"idle_splash_after_seconds": 10}}
+    assert shazam.has_recent_track(95.0, 100.0, cfg) is True
+
+
+def test_status_state_listening():
+    assert shazam.classify_status_state("Listening...") == "listening"
+
+
+def test_status_state_recognizing():
+    assert shazam.classify_status_state("Recognizing...") == "recognizing"
+
+
+def test_status_state_no_match():
+    assert shazam.classify_status_state("No Match Found") == "no_match"
+
+
+def test_status_state_error():
+    assert shazam.classify_status_state("Error: Recognition failed") == "error"
+
+
+def test_status_state_starting():
+    assert shazam.classify_status_state("Initialising...") == "starting"
+
+
+def test_status_state_ready():
+    assert shazam.classify_status_state("Ready (Restored)") == "ready"
+
+
+def test_status_state_default_falls_to_idle():
+    assert shazam.classify_status_state("") == "idle"
+
+
+def test_status_dot_color_preserves_error_and_no_match_states():
+    assert shazam.status_dot_color("error") == "#dc2626"
+    assert shazam.status_dot_color("no_match") == "#8b919c"
+
+
+class _FakeFont:
+    """Minimal stand-in for tkFont.Font.measure that doesn't need a Tk root."""
+    def __init__(self, char_px: int = 8):
+        self.char_px = char_px
+
+    def measure(self, text: str) -> int:
+        return len(text) * self.char_px
+
+
+def test_longest_word_pixel_width_picks_widest():
+    font = _FakeFont(char_px=10)
+    assert shazam.longest_word_pixel_width("Supercalifragilistic a b", font) == 200
+
+
+def test_longest_word_pixel_width_empty():
+    assert shazam.longest_word_pixel_width("", _FakeFont()) == 0
+
+
+def test_truncate_word_to_width_no_op_when_fits():
+    assert shazam.truncate_word_to_width("Hi", _FakeFont(char_px=10), 100) == "Hi"
+
+
+def test_truncate_word_to_width_ellipsizes_overlong():
+    out = shazam.truncate_word_to_width("Supercalifragilistic", _FakeFont(char_px=10), 100)
+    assert out.endswith("…")
+    assert len(out) < len("Supercalifragilistic")
+
+
+def test_ensure_words_fit_keeps_short_words():
+    out = shazam.ensure_words_fit("hello world", _FakeFont(char_px=10), 200)
+    assert out == "hello world"
+
+
+def test_ensure_words_fit_ellipsizes_one_long_word():
+    out = shazam.ensure_words_fit("hello Supercalifragilistic world", _FakeFont(char_px=10), 100)
+    assert "hello" in out
+    assert "world" in out
+    assert "Supercalifragilistic" not in out
+    assert "…" in out

@@ -4,6 +4,7 @@ shazamio==0.7.0
 requests
 pillow
 screeninfo
+pyserial>=3.5
 # audioop was removed in Python 3.13+. This backport restores it so pydub works.
 audioop-lts; python_version >= "3.13"
 # shazamio 0.7.0 depends on numpy==2.1.2; wheels exist for Python 3.12 universal2 on macOS.

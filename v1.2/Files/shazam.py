@@ -12,6 +12,7 @@ import io
 import os
 import json
 import math
+import colorsys
 import re
 import unicodedata
 from screeninfo import get_monitors
@@ -24,6 +25,7 @@ import sys
 import time
 from typing import Optional, Dict, Any, Tuple, List, Literal, Union
 from pathlib import Path
+from led_controller import LedController
 
 # Only set ALSA hint on Linux (avoids breaking macOS/Windows)
 if sys.platform.startswith("linux"):
@@ -61,6 +63,7 @@ MIN_WINDOW_HEIGHT = 200
 
 # --- Global State ---
 config: Dict[str, Any] = {}
+led_controller: Optional[LedController] = None
 root: Optional[tk.Tk] = None
 canvas: Optional[tk.Canvas] = None
 title_label_id: Optional[int] = None
@@ -75,12 +78,49 @@ lyrics_primary_label_id: Optional[int] = None
 lyrics_secondary_label_id: Optional[int] = None
 lyrics_tertiary_label_id: Optional[int] = None
 coverart_item_id: Optional[int] = None
+cover_halo_photo_ref: Optional["ImageTk.PhotoImage"] = None
+cover_halo_item_id: Optional[int] = None
 
 accent_color_hex: str = "#7c8fff"   # Cover-art derived accent; updated per track.
+led_color_hex: str = "#7c8fff"      # Hardware color; sampled from the unblurred cover.
 ui_font_family_cache: Optional[str] = None
 status_pulse_phase: float = 0.0
 status_pulse_job_id: Optional[str] = None
 status_pill_layout: Dict[str, Any] = {}   # Cached args for re-rendering on text change
+
+lyric_glow_phase: float = 0.0
+lyric_glow_job_id: Optional[str] = None
+
+lyric_transition_state: Dict[str, Any] = {
+    "active": False,
+    "start_monotonic": 0.0,
+    "duration": 0.32,
+    "last_index": -1,
+}
+
+last_recognition_monotonic: float = 0.0   # Updated when a match resolves.
+
+track_change_state: Dict[str, Any] = {
+    "active": False,
+    "start_monotonic": 0.0,
+    "duration": 0.3,
+    "previous_accent": "#7c8fff",
+}
+track_change_job_id: Optional[str] = None
+
+ken_burns_frame_a_ref: Optional["ImageTk.PhotoImage"] = None
+ken_burns_frame_b_ref: Optional["ImageTk.PhotoImage"] = None
+ken_burns_item_a: Optional[int] = None
+ken_burns_item_b: Optional[int] = None
+ken_burns_phase: float = 0.0
+ken_burns_direction: int = 1
+ken_burns_job_id: Optional[str] = None
+ken_burns_last_window_size: Tuple[int, int] = (0, 0)
+
+idle_splash_active: bool = False
+idle_splash_bg_id: Optional[int] = None
+idle_splash_bg_photo_ref: Optional["ImageTk.PhotoImage"] = None
+idle_splash_wordmark_id: Optional[int] = None
 
 bg_photo_ref: Optional[ImageTk.PhotoImage] = None
 square_photo_ref: Optional[ImageTk.PhotoImage] = None
@@ -150,12 +190,24 @@ def load_config() -> Dict[str, Any]:
             "status_font_size_ratio": 0.8, # Base ratio before halving
             "history_max_items_retain": 20, # Max items to keep images for on disk
             "vignette_intensity": 0.55,
+            "ken_burns_enabled": True,
+            "motion_reduced": False,
+            "idle_splash_enabled": True,
+            "idle_splash_after_seconds": 10,
+            "accent_halo_intensity": 0.35,
         },
         "network": {"timeout": 7, "retry_count": 3, "retry_delay": 2},
+        "led": {
+            "enabled": False, "port": "", "baud_rate": 115200,
+            "brightness": 96, "pixel_count": 30, "data_pin": 6,
+            "saturation_multiplier": 1.25, "value_multiplier": 1.0,
+            "reset_delay_seconds": 2.0,
+        },
         "lyrics": {
             "enabled": True,
             "show_plain_lyrics": False,
             "prefer_synced_lyrics": True,
+            "lines_visible": 3,
             "force_cinematic_mode": True,
             "fullscreen_implies_cinematic_mode": True,
             "refresh_interval_ms": 250,
@@ -597,6 +649,22 @@ def hex_to_rgb(value: str) -> Tuple[int, int, int]:
         return (124, 143, 255)
 
 
+SCRIM_RGB: Tuple[int, int, int] = (10, 10, 12)  # #0a0a0c — same as canvas bg fallback.
+
+
+def dim_hex(value: str, amount: float) -> str:
+    """Blends a hex color toward black by `amount` (0..1). amount=1 → black."""
+    rgb = hex_to_rgb(value)
+    return rgb_to_hex(mix_rgb(rgb, (0, 0, 0), amount))
+
+
+def simulate_alpha_on_dark(value: str, alpha: float) -> str:
+    """Tk text has no alpha — simulate by blending the color toward the dark scrim.
+    alpha=1.0 returns the color unchanged; alpha=0.0 returns the scrim color."""
+    alpha = max(0.0, min(1.0, alpha))
+    return rgb_to_hex(mix_rgb(SCRIM_RGB, hex_to_rgb(value), alpha))
+
+
 def extract_accent_color(image: Image.Image) -> str:
     """Picks a vibrant accent color from the cover art.
 
@@ -637,6 +705,61 @@ def extract_accent_color(image: Image.Image) -> str:
         return "#7c8fff"
 
 
+NEAR_BLACK_MAX_CHANNEL = 40  # Matches extract_accent_color's near-black cutoff.
+
+
+def extract_dominant_color(image: Image.Image) -> str:
+    """Returns the cover art's true dominant color, by pixel population.
+
+    Unlike extract_accent_color (which deliberately discards near-black/
+    near-white buckets and biases toward saturated colors so the UI gets a
+    pleasant accent), this reports whatever color actually covers the most
+    pixels — including muted or near-white dominants. That's what the LED
+    strip should reproduce to match the album art.
+
+    Near-black is the one exception: a black-dominant cover (common for
+    minimalist/dark album art) would otherwise just turn the strip off, so
+    the next most-populous non-black bucket is used instead. If every
+    bucket is near-black, black wins anyway — there's no better option.
+    """
+    try:
+        thumb = image.convert("RGB").resize((96, 96), Image.Resampling.BILINEAR)
+        quant = thumb.quantize(colors=8, method=Image.Quantize.MEDIANCUT)
+        palette = quant.getpalette() or []
+        counts = sorted(quant.getcolors() or [], reverse=True)
+        if not counts:
+            return "#7c8fff"
+        for _, idx in counts:
+            r = palette[idx * 3 + 0]
+            g = palette[idx * 3 + 1]
+            b = palette[idx * 3 + 2]
+            if max(r, g, b) >= NEAR_BLACK_MAX_CHANNEL:
+                return rgb_to_hex((r, g, b))
+        _, idx = counts[0]
+        r = palette[idx * 3 + 0]
+        g = palette[idx * 3 + 1]
+        b = palette[idx * 3 + 2]
+        return rgb_to_hex((r, g, b))
+    except Exception as e:
+        logger.debug(f"Dominant color extraction failed: {e}")
+        return "#7c8fff"
+
+
+def tune_led_color(color: str, saturation_multiplier: float = 1.25,
+                   value_multiplier: float = 1.0) -> str:
+    """Increase LED saturation/value without shifting the cover's hue.
+
+    The UI accent remains untouched. This hardware-only transform compensates
+    for the muted appearance common to WS2812B strips at safe brightness.
+    """
+    red, green, blue = hex_to_rgb(color)
+    hue, saturation, value = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue / 255.0)
+    saturation = max(0.0, min(1.0, saturation * max(0.0, saturation_multiplier)))
+    value = max(0.0, min(1.0, value * max(0.0, value_multiplier)))
+    tuned = colorsys.hsv_to_rgb(hue, saturation, value)
+    return rgb_to_hex(tuple(int(channel * 255) for channel in tuned))
+
+
 def apply_vignette(image: Image.Image, intensity: float = 0.55) -> Image.Image:
     """Composites a radial darken vignette onto a blurred backdrop so foreground
     text remains readable regardless of cover-art brightness. One PIL pass per
@@ -665,6 +788,266 @@ def apply_vignette(image: Image.Image, intensity: float = 0.55) -> Image.Image:
     except Exception as e:
         logger.debug(f"Vignette failed: {e}")
         return image
+
+
+def build_ken_burns_frames(source_image_path: Path, width: int, height: int,
+                           blur_strength: int, vignette_intensity: float) -> Optional[Tuple[Image.Image, Image.Image]]:
+    """Pre-renders two slightly-different zoom/translate variants of the
+    blurred+vignetted backdrop. Tk crossfades between them."""
+    try:
+        base = create_blurred_background(source_image_path, width, height, blur_strength)
+        if base is None:
+            return None
+        base = apply_vignette(base, intensity=vignette_intensity)
+        a = base.resize((int(width * 1.04), int(height * 1.04)), Image.Resampling.LANCZOS)
+        a = a.crop((0, 0, width, height))
+        b = base.resize((int(width * 1.10), int(height * 1.10)), Image.Resampling.LANCZOS)
+        offset_x = (int(width * 1.10) - width)
+        offset_y = (int(height * 1.10) - height)
+        b = b.crop((offset_x, offset_y, offset_x + width, offset_y + height))
+        return a, b
+    except Exception as e:
+        logger.debug(f"build_ken_burns_frames failed: {e}")
+        return None
+
+
+def install_ken_burns(image_file_path: Path, width: int, height: int) -> bool:
+    """Replaces the static blurred background with two crossfading frames."""
+    global ken_burns_frame_a_ref, ken_burns_frame_b_ref
+    global ken_burns_item_a, ken_burns_item_b, ken_burns_last_window_size
+
+    gui_cfg = config.get("gui", {})
+    if not bool(gui_cfg.get("ken_burns_enabled", True)) or not is_motion_enabled(config):
+        return False
+    if not canvas or width <= 0 or height <= 0:
+        return False
+
+    vignette_intensity = safe_float(gui_cfg.get("vignette_intensity")) or 0.55
+    blur_strength = gui_cfg.get("blur_strength", 15)
+    frames = build_ken_burns_frames(image_file_path, width, height, blur_strength, vignette_intensity)
+    if frames is None:
+        return False
+
+    ken_burns_frame_a_ref = ImageTk.PhotoImage(frames[0])
+    ken_burns_frame_b_ref = ImageTk.PhotoImage(frames[1])
+
+    try:
+        canvas.delete("background")
+    except tk.TclError:
+        pass
+
+    ken_burns_item_a = canvas.create_image(0, 0, anchor=tk.NW, image=ken_burns_frame_a_ref,
+                                            tags=("background", "ken_burns"))
+    ken_burns_item_b = canvas.create_image(0, 0, anchor=tk.NW, image=ken_burns_frame_b_ref,
+                                            tags=("background", "ken_burns"), state="hidden")
+    canvas.tag_lower("background")
+    ken_burns_last_window_size = (width, height)
+    return True
+
+
+def tick_ken_burns():
+    """24s cycle that crossfades by toggling visibility of frame A vs frame B at midpoint."""
+    global ken_burns_job_id, ken_burns_phase, ken_burns_direction
+    ken_burns_job_id = None
+    if not root or not canvas or not root.winfo_exists():
+        return
+    if not is_motion_enabled(config) or ken_burns_item_a is None:
+        try:
+            ken_burns_job_id = root.after(2000, tick_ken_burns)
+        except tk.TclError:
+            ken_burns_job_id = None
+        return
+    cycle_seconds = 24.0
+    step = (1.0 / cycle_seconds) * 0.5  # 0.5s tick
+    ken_burns_phase += step * ken_burns_direction
+    if ken_burns_phase >= 1.0:
+        ken_burns_phase = 1.0
+        ken_burns_direction = -1
+    elif ken_burns_phase <= 0.0:
+        ken_burns_phase = 0.0
+        ken_burns_direction = 1
+    try:
+        if ken_burns_phase < 0.5:
+            canvas.itemconfigure(ken_burns_item_a, state="normal")
+            canvas.itemconfigure(ken_burns_item_b, state="hidden")
+        else:
+            canvas.itemconfigure(ken_burns_item_a, state="hidden")
+            canvas.itemconfigure(ken_burns_item_b, state="normal")
+    except tk.TclError:
+        return
+    try:
+        ken_burns_job_id = root.after(500, tick_ken_burns)
+    except tk.TclError:
+        ken_burns_job_id = None
+
+
+SPLASH_STOPS = [
+    (124, 143, 255),    # cool indigo
+    (200, 110, 180),    # warm pink
+    (140, 200, 230),    # cool sky
+]
+
+
+def build_splash_gradient(width: int, height: int, phase: float = 0.0) -> Image.Image:
+    """Three-stop mesh-gradient backdrop for the idle splash. `phase` rotates
+    which stops anchor which corners (so consecutive renders shift mood)."""
+    try:
+        scale = 6  # render small + upscale, much faster than per-pixel at native res
+        sw, sh = max(8, width // scale), max(8, height // scale)
+        layer = Image.new("RGB", (sw, sh), (10, 10, 12))
+        pix = layer.load()
+        offset = int(phase) % len(SPLASH_STOPS)
+        stops = [SPLASH_STOPS[(i + offset) % len(SPLASH_STOPS)] for i in range(3)]
+        centers = [
+            (int(sw * 0.25), int(sh * 0.30)),
+            (int(sw * 0.78), int(sh * 0.40)),
+            (int(sw * 0.50), int(sh * 0.78)),
+        ]
+        max_r = max(sw, sh) * 0.7
+        for cx, cy in centers:
+            rgb = stops[centers.index((cx, cy))]
+            for y in range(sh):
+                for x in range(sw):
+                    dx = x - cx; dy = y - cy
+                    d = (dx * dx + dy * dy) ** 0.5
+                    t = max(0.0, 1.0 - d / max_r)
+                    t = t * t * 0.6
+                    r0, g0, b0 = pix[x, y]
+                    r1, g1, b1 = rgb
+                    pix[x, y] = (
+                        int(r0 + (r1 - r0) * t),
+                        int(g0 + (g1 - g0) * t),
+                        int(b0 + (b1 - b0) * t),
+                    )
+        layer = layer.resize((width, height), Image.Resampling.BILINEAR)
+        return layer.filter(ImageFilter.GaussianBlur(max(20, min(width, height) // 12)))
+    except Exception as e:
+        logger.debug(f"build_splash_gradient failed: {e}")
+        return Image.new("RGB", (width, height), (10, 10, 12))
+
+
+def render_idle_splash(window_width: int, window_height: int) -> None:
+    """Paints the idle splash: full-window mesh gradient + centered wordmark."""
+    global idle_splash_bg_id, idle_splash_bg_photo_ref, idle_splash_wordmark_id
+    if not canvas:
+        return
+    try:
+        gradient = build_splash_gradient(window_width, window_height, phase=0.0)
+        idle_splash_bg_photo_ref = ImageTk.PhotoImage(gradient)
+        if idle_splash_bg_id:
+            try:
+                canvas.itemconfigure(idle_splash_bg_id, image=idle_splash_bg_photo_ref)
+            except tk.TclError:
+                idle_splash_bg_id = None
+        if not idle_splash_bg_id:
+            idle_splash_bg_id = canvas.create_image(
+                0, 0, anchor=tk.NW,
+                image=idle_splash_bg_photo_ref,
+                tags=("idle_splash",),
+            )
+
+        wordmark_size = compute_type_scale(min(window_width, window_height))["wordmark"]
+        font_obj = (get_ui_font_family(), wordmark_size, "bold")
+        text_x = window_width / 2
+        text_y = window_height / 2
+        if idle_splash_wordmark_id:
+            try:
+                canvas.coords(idle_splash_wordmark_id, text_x, text_y)
+                canvas.itemconfigure(
+                    idle_splash_wordmark_id,
+                    text="SongPi",
+                    font=font_obj,
+                    fill="#ffffff",
+                    anchor=tk.CENTER,
+                )
+            except tk.TclError:
+                idle_splash_wordmark_id = None
+        if not idle_splash_wordmark_id:
+            idle_splash_wordmark_id = canvas.create_text(
+                text_x, text_y,
+                text="SongPi",
+                font=font_obj,
+                fill="#ffffff",
+                anchor=tk.CENTER,
+                tags=("idle_splash", "wordmark"),
+            )
+        canvas.tag_raise("idle_splash")
+        canvas.tag_raise("status_pill")
+    except tk.TclError as e:
+        logger.debug(f"render_idle_splash failed: {e}")
+
+
+def hide_idle_splash() -> None:
+    """Removes splash items if present."""
+    if not canvas:
+        return
+    try:
+        canvas.delete("idle_splash")
+    except tk.TclError:
+        pass
+    global idle_splash_bg_id, idle_splash_bg_photo_ref, idle_splash_wordmark_id
+    idle_splash_bg_id = None
+    idle_splash_bg_photo_ref = None
+    idle_splash_wordmark_id = None
+
+
+def build_cover_halo(cover_size: int, accent_hex: str, intensity: float) -> Optional[Image.Image]:
+    """Returns a PIL RGBA image of a soft accent-colored halo sized 1.18× the
+    cover. Used as a glow plate placed behind the cover art."""
+    try:
+        side = max(8, int(cover_size * 1.18))
+        halo = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(halo)
+        r, g, b = hex_to_rgb(accent_hex)
+        alpha = int(255 * max(0.0, min(1.0, intensity)))
+        margin = side // 8
+        draw.ellipse([margin, margin, side - margin, side - margin],
+                     fill=(r, g, b, alpha))
+        blur_px = max(8, side // 8)
+        return halo.filter(ImageFilter.GaussianBlur(blur_px))
+    except Exception as e:
+        logger.debug(f"build_cover_halo failed: {e}")
+        return None
+
+
+def render_cover_halo(square_x: float, square_y: float, square_size: int) -> None:
+    """Renders (or refreshes) the accent halo behind the cover art."""
+    global cover_halo_photo_ref, cover_halo_item_id
+    if not canvas:
+        return
+    intensity = safe_float(config.get("gui", {}).get("accent_halo_intensity")) or 0.35
+    halo_image = build_cover_halo(square_size, accent_color_hex, intensity)
+    if halo_image is None:
+        if cover_halo_item_id:
+            try:
+                canvas.delete(cover_halo_item_id)
+            except tk.TclError:
+                pass
+            cover_halo_item_id = None
+        cover_halo_photo_ref = None
+        return
+    cover_halo_photo_ref = ImageTk.PhotoImage(halo_image)
+    if cover_halo_item_id:
+        try:
+            canvas.coords(cover_halo_item_id, square_x, square_y)
+            canvas.itemconfigure(cover_halo_item_id, image=cover_halo_photo_ref)
+        except tk.TclError:
+            cover_halo_item_id = None
+    if not cover_halo_item_id:
+        cover_halo_item_id = canvas.create_image(
+            square_x, square_y,
+            anchor=tk.CENTER,
+            image=cover_halo_photo_ref,
+            # Keep the halo out of the broad background tag: backdrop refreshes
+            # delete that tag, while the halo has its own lifecycle and ID.
+            tags=("cover_halo",),
+        )
+    try:
+        canvas.tag_raise("cover_halo", "background")
+        if coverart_item_id:
+            canvas.tag_raise(coverart_item_id, "cover_halo")
+    except tk.TclError:
+        pass
 
 
 def draw_rounded_rect(canvas_obj: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
@@ -698,6 +1081,107 @@ def draw_rounded_rect(canvas_obj: tk.Canvas, x1: float, y1: float, x2: float, y2
             pass
     return canvas_obj.create_polygon(points, fill=fill, outline=outline,
                                      smooth=True, splinesteps=24, tags=tags)
+
+
+# --- Layout system ---
+
+def detect_layout_breakpoint(width: int, height: int) -> str:
+    """Returns 'wide', 'mid', or 'stacked' based on window dimensions per spec §4."""
+    if height <= 0:
+        return "stacked"
+    aspect = width / height
+    if width >= 900 and aspect >= 1.2:
+        return "wide"
+    if width < 900 or aspect < 0.95:
+        return "stacked"
+    return "mid"
+
+
+def should_use_cinematic_mode(width: int, height: int, is_fullscreen: bool,
+                              lyrics_cfg: Dict[str, Any]) -> bool:
+    """Resolve whether the split/compact cinematic layout is safe to render.
+
+    Fullscreen alone must not force overlapping columns on a narrow display;
+    the geometry breakpoint remains authoritative unless explicitly forced.
+    """
+    if not bool(lyrics_cfg.get("enabled", True)):
+        return False
+    if bool(lyrics_cfg.get("force_cinematic_mode", False)):
+        return True
+    breakpoint = detect_layout_breakpoint(width, height)
+    if breakpoint == "stacked":
+        return False
+    fullscreen_requested = (
+        bool(lyrics_cfg.get("fullscreen_implies_cinematic_mode", True))
+        and bool(is_fullscreen)
+    )
+    return breakpoint in ("wide", "mid") or fullscreen_requested
+
+
+def format_artist_label(value: str, max_chars: int = 40) -> str:
+    """Renders the artist label in uppercase. If short enough, inserts hair
+    spaces between letters to fake letter-tracking (Tk lacks letter-spacing)."""
+    if not value:
+        return ""
+    upper = value.upper()
+    if len(upper) <= max_chars:
+        return " ".join(upper)
+    return upper
+
+
+def is_low_power_host() -> bool:
+    """Heuristic: Pi 3 (armv7) is the canonical low-power target. Anything
+    armv7 with <=4 cores triggers the reduced-motion profile by default."""
+    import platform
+    machine = platform.machine().lower()
+    cpu_count = os.cpu_count() or 1
+    return machine.startswith("armv7") and cpu_count <= 4
+
+
+def is_motion_enabled(cfg: Dict[str, Any]) -> bool:
+    """True when full motion (Ken Burns, glow breath, choreography) should run."""
+    if bool(cfg.get("gui", {}).get("motion_reduced", False)):
+        return False
+    return not is_low_power_host()
+
+
+def should_show_idle_splash(last_match_monotonic: float, now_monotonic: float,
+                            has_active_track: bool, cfg: Dict[str, Any]) -> bool:
+    """Splash if: enabled, no active track, and >= idle_splash_after_seconds
+    have elapsed since any successful match."""
+    gui_cfg = cfg.get("gui", {})
+    if not bool(gui_cfg.get("idle_splash_enabled", True)):
+        return False
+    if has_active_track:
+        return False
+    threshold = safe_float(gui_cfg.get("idle_splash_after_seconds")) or 10.0
+    return (now_monotonic - last_match_monotonic) >= threshold
+
+
+def has_recent_track(last_match_monotonic: float, now_monotonic: float,
+                     cfg: Dict[str, Any]) -> bool:
+    """True only while a successful recognition is recent enough to be active."""
+    if last_match_monotonic <= 0.0:
+        return False
+    threshold = safe_float(cfg.get("gui", {}).get("idle_splash_after_seconds")) or 10.0
+    return (now_monotonic - last_match_monotonic) < threshold
+
+
+def compute_type_scale(short_edge: int) -> Dict[str, int]:
+    """Maps window short-edge px to the responsive type sizes from spec §3."""
+    s = max(0, int(short_edge))
+    return {
+        "title":          int(responsive_clamp(18, s * 0.035, 38)),
+        "artist":         int(responsive_clamp(11, s * 0.018, 18)),
+        "album":          int(responsive_clamp(10, s * 0.015, 15)),
+        "lyric_active":   int(responsive_clamp(22, s * 0.052, 64)),
+        "lyric_context":  int(responsive_clamp(13, s * 0.025, 24)),
+        "status_pill":    int(responsive_clamp(9,  s * 0.013, 14)),
+        "history_title":  int(responsive_clamp(9,  s * 0.013, 13)),
+        "history_artist": int(responsive_clamp(8,  s * 0.011, 11)),
+        "wordmark":       int(responsive_clamp(28, s * 0.060, 96)),
+    }
+
 
 def create_placeholder_image(path: Path, width: int, height: int, text: str) -> bool:
     """Creates a simple placeholder image with text and saves it."""
@@ -1108,6 +1592,73 @@ def safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def responsive_clamp(min_value: float, value: float, max_value: float) -> float:
+    """CSS-style clamp(lo, val, hi). Used throughout the responsive type/spacing scale."""
+    if value < min_value:
+        return min_value
+    if value > max_value:
+        return max_value
+    return value
+
+
+def ease_out_cubic(t: float) -> float:
+    """Cubic ease-out: fast start, gentle landing. Domain and range [0, 1]."""
+    t = max(0.0, min(1.0, t))
+    return 1.0 - (1.0 - t) ** 3
+
+
+def longest_word_pixel_width(text: str, font_obj: tkFont.Font) -> int:
+    """Returns the pixel width of the widest single whitespace-delimited token
+    in `text`. Used by `fit_canvas_title_font` to prevent Tk's character-wrap
+    fallback from breaking long words mid-glyph."""
+    if not text:
+        return 0
+    try:
+        return max((font_obj.measure(w) for w in text.split()), default=0)
+    except tk.TclError:
+        return 0
+
+
+def truncate_word_to_width(word: str, font_obj: tkFont.Font, width: int) -> str:
+    """Cuts an oversized word down to `width` pixels, appending an ellipsis.
+    Last-resort fallback when even the smallest legal font can't fit the
+    longest word in the allotted column."""
+    if width <= 0 or not word:
+        return word
+    ellipsis = "…"
+    try:
+        if font_obj.measure(word) <= width:
+            return word
+        # Binary search for the longest prefix that fits.
+        lo, hi = 0, len(word)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font_obj.measure(word[:mid] + ellipsis) <= width:
+                lo = mid
+            else:
+                hi = mid - 1
+        return word[:lo] + ellipsis if lo > 0 else ellipsis
+    except tk.TclError:
+        return word
+
+
+def ensure_words_fit(text: str, font_obj: tkFont.Font, width: int) -> str:
+    """Replaces any word too wide to fit the wrap column with a truncated
+    variant. Preserves whitespace runs (newlines, multiple spaces collapse
+    to single spaces because Tk wraps on whitespace anyway)."""
+    if not text or width <= 0:
+        return text
+    out_tokens: List[str] = []
+    for word in text.split():
+        try:
+            if font_obj.measure(word) > width:
+                word = truncate_word_to_width(word, font_obj, width)
+        except tk.TclError:
+            pass
+        out_tokens.append(word)
+    return " ".join(out_tokens)
+
+
 def fit_canvas_title_font(
     canvas_obj: tk.Canvas,
     text_item_id: Optional[int],
@@ -1126,7 +1677,10 @@ def fit_canvas_title_font(
     slant: str = "roman",
     tags: Tuple[str, ...] = ("main_text",),
 ) -> Tuple[int, tkFont.Font, Tuple[int, int, int, int]]:
-    """Shrinks the current-song title font until its wrapped height fits the allotted block."""
+    """Shrinks the font until the wrapped text fits both the height budget and
+    no single word overflows the wrap column. Long words trigger an additional
+    size shrink so Tk never falls back to mid-glyph character wrap. As a final
+    fallback at `min_size`, overlong words are ellipsized."""
     if family is None:
         family = get_ui_font_family()
     font_size = max(min_size, base_size)
@@ -1137,11 +1691,21 @@ def fit_canvas_title_font(
 
     while font_size >= min_size:
         font_obj = tkFont.Font(family=family, size=font_size, weight=weight, slant=slant)
+
+        render_text = text
+        # If the longest word doesn't fit at this size, shrink further. Only when
+        # we're already at min_size do we accept the size and ellipsize the word.
+        if width > 0 and longest_word_pixel_width(text, font_obj) > width:
+            if font_size > min_size:
+                font_size -= 1
+                continue
+            render_text = ensure_words_fit(text, font_obj, width)
+
         if item_id:
             canvas_obj.coords(item_id, x_pos, y_pos)
             canvas_obj.itemconfigure(
                 item_id,
-                text=text,
+                text=render_text,
                 font=font_obj,
                 fill=fill,
                 anchor=anchor,
@@ -1153,7 +1717,7 @@ def fit_canvas_title_font(
             item_id = canvas_obj.create_text(
                 x_pos,
                 y_pos,
-                text=text,
+                text=render_text,
                 font=font_obj,
                 fill=fill,
                 anchor=anchor,
@@ -1920,7 +2484,21 @@ def compute_current_lyrics_lines() -> List[str]:
             - lrc_offset
             + user_adjust
         )
-        return build_synced_lyrics_lines(max(0.0, playback_seconds))
+        playback_seconds = max(0.0, playback_seconds)
+
+        # Detect line advances → start a fade-in transition.
+        active_index = -1
+        for i, line in enumerate(lyrics_state["synced_lines"]):
+            if playback_seconds >= line["time_seconds"]:
+                active_index = i
+            else:
+                break
+        if active_index != lyric_transition_state["last_index"] and is_motion_enabled(config):
+            lyric_transition_state["active"] = True
+            lyric_transition_state["start_monotonic"] = time.monotonic()
+        lyric_transition_state["last_index"] = active_index
+
+        return build_synced_lyrics_lines(playback_seconds)
 
     if config.get("lyrics", {}).get("show_plain_lyrics", True):
         plain_lines = [line.strip() for line in lyrics_state.get("plain_lyrics", "").splitlines() if line.strip()]
@@ -2052,6 +2630,37 @@ def render_lyrics_labels():
     canvas.tag_raise("main_text")
 
 
+def classify_status_state(message: str) -> str:
+    """Maps a status message string to a state token consumed by the pill renderer."""
+    msg = (message or "").lower()
+    if not msg.strip():
+        return "idle"
+    if "error" in msg or "offline" in msg:
+        return "error"
+    if "no match" in msg:
+        return "no_match"
+    if "init" in msg or "starting" in msg:
+        return "starting"
+    if "ready" in msg or "restored" in msg:
+        return "ready"
+    if "recogni" in msg or "retry" in msg:
+        return "recognizing"
+    if "listen" in msg or "fetch" in msg or "loading" in msg:
+        return "listening"
+    return "idle"
+
+
+def status_dot_color(state: str) -> str:
+    """Return the static dot color for a classified status state."""
+    if state in ("listening", "recognizing", "starting"):
+        return accent_color_hex
+    if state == "error":
+        return "#dc2626"
+    if state == "no_match":
+        return "#8b919c"
+    return "#5b6270"
+
+
 def render_status_pill(text_x: float, text_y: float, anchor: str, font_size: int) -> None:
     """Draws the status row as a rounded pill (dot + label).
 
@@ -2107,10 +2716,9 @@ def render_status_pill(text_x: float, text_y: float, anchor: str, font_size: int
         existing_id=status_pill_bg_id,
     )
 
-    # Dot — accent color when "working", muted grey when idle.
-    msg_lower = label_text.lower()
-    working = any(k in msg_lower for k in ("listen", "recogni", "retry", "loading", "fetch"))
-    dot_color = accent_color_hex if working else "#5b6270"
+    # Dot color is driven by classified state.
+    state = classify_status_state(label_text)
+    dot_color = status_dot_color(state)
     dot_cx = x1 + pad_x + dot_radius
     dot_cy = (y1 + y2) / 2
     if status_pill_dot_id:
@@ -2166,8 +2774,8 @@ def tick_status_pulse():
         return
     try:
         if status_pill_dot_id:
-            msg_lower = (current_status_message or "").lower()
-            working = any(k in msg_lower for k in ("listen", "recogni", "retry", "loading", "fetch"))
+            state = classify_status_state(current_status_message)
+            working = state in ("listening", "recognizing", "starting")
             if working:
                 status_pulse_phase = (status_pulse_phase + 0.25) % (2 * math.pi)
                 pulse = 0.5 + 0.5 * math.sin(status_pulse_phase)  # 0..1
@@ -2176,7 +2784,7 @@ def tick_status_pulse():
                 rgb = mix_rgb(dim_rgb, accent_rgb, pulse)
                 canvas.itemconfigure(status_pill_dot_id, fill=rgb_to_hex(rgb))
             else:
-                canvas.itemconfigure(status_pill_dot_id, fill="#5b6270")
+                canvas.itemconfigure(status_pill_dot_id, fill=status_dot_color(state))
     except tk.TclError:
         pass
 
@@ -2184,6 +2792,114 @@ def tick_status_pulse():
         status_pulse_job_id = root.after(220, tick_status_pulse)
     except tk.TclError:
         status_pulse_job_id = None
+
+
+def tick_lyric_glow():
+    """Drives the breathing-glow color cycle on the active lyric line.
+
+    Sin-curve over ~3.6s, blending between the base active color and a
+    brighter variant. Disabled when motion is reduced."""
+    global lyric_glow_job_id, lyric_glow_phase
+    lyric_glow_job_id = None
+    if not root or not canvas or not root.winfo_exists():
+        return
+    if not is_motion_enabled(config):
+        try:
+            lyric_glow_job_id = root.after(1000, tick_lyric_glow)
+        except tk.TclError:
+            lyric_glow_job_id = None
+        return
+    try:
+        if lyrics_primary_label_id and lyrics_state.get("synced_lines"):
+            lyric_glow_phase = (lyric_glow_phase + (2 * math.pi / 36)) % (2 * math.pi)
+            pulse = 0.5 + 0.5 * math.sin(lyric_glow_phase)
+            accent_rgb = hex_to_rgb(accent_color_hex)
+            base = mix_rgb(accent_rgb, (255, 255, 255), 0.35)
+            bright = mix_rgb(accent_rgb, (255, 255, 255), 0.55)
+            blended = mix_rgb(base, bright, pulse * 0.6)
+            canvas.itemconfigure(lyrics_primary_label_id, fill=rgb_to_hex(blended))
+    except tk.TclError:
+        pass
+    try:
+        lyric_glow_job_id = root.after(100, tick_lyric_glow)
+    except tk.TclError:
+        lyric_glow_job_id = None
+
+
+def begin_track_change_choreography(previous_accent: str) -> None:
+    """Kicks off the 300ms color/meta crossfade after a different-track recognition."""
+    if not is_motion_enabled(config):
+        return
+    track_change_state["active"] = True
+    track_change_state["start_monotonic"] = time.monotonic()
+    track_change_state["previous_accent"] = previous_accent or "#7c8fff"
+    if root and root.winfo_exists():
+        try:
+            root.after(16, tick_track_change_choreography)
+        except tk.TclError:
+            pass
+
+
+def tick_track_change_choreography():
+    """Per-frame interpolation of accent color across UI elements during a track change."""
+    global track_change_job_id
+    track_change_job_id = None
+    if not track_change_state.get("active") or not canvas:
+        return
+    elapsed = time.monotonic() - track_change_state["start_monotonic"]
+    duration = track_change_state["duration"]
+    if elapsed >= duration:
+        track_change_state["active"] = False
+        return
+    t = ease_out_cubic(elapsed / duration)
+    prev_rgb = hex_to_rgb(track_change_state["previous_accent"])
+    new_rgb = hex_to_rgb(accent_color_hex)
+    blended = rgb_to_hex(mix_rgb(prev_rgb, new_rgb, t))
+    try:
+        if progress_bar_fill_id:
+            canvas.itemconfigure(progress_bar_fill_id, fill=blended)
+        if status_pill_dot_id and classify_status_state(current_status_message) in ("listening", "recognizing", "starting"):
+            canvas.itemconfigure(status_pill_dot_id, fill=blended)
+    except tk.TclError:
+        track_change_state["active"] = False
+        return
+    if root and root.winfo_exists():
+        try:
+            track_change_job_id = root.after(16, tick_track_change_choreography)
+        except tk.TclError:
+            track_change_job_id = None
+
+
+def tick_lyric_transition():
+    """Applies the per-frame fade-in for a freshly-advanced lyric line.
+
+    Active for `lyric_transition_state['duration']` seconds after a line
+    change; blends the active line's color from a low-opacity accent toward
+    full while shifting it vertically by a few pixels (ease-out)."""
+    if not lyric_transition_state.get("active"):
+        return
+    if not canvas or not lyrics_primary_label_id:
+        return
+    elapsed = time.monotonic() - lyric_transition_state["start_monotonic"]
+    duration = lyric_transition_state["duration"]
+    if elapsed >= duration:
+        lyric_transition_state["active"] = False
+        return
+    t = ease_out_cubic(elapsed / duration)
+    accent_rgb = hex_to_rgb(accent_color_hex)
+    base = mix_rgb(accent_rgb, (255, 255, 255), 0.35)
+    start_color = simulate_alpha_on_dark(rgb_to_hex(base), 0.4)
+    end_color = rgb_to_hex(base)
+    blended = mix_rgb(hex_to_rgb(start_color), hex_to_rgb(end_color), t)
+    try:
+        canvas.itemconfigure(lyrics_primary_label_id, fill=rgb_to_hex(blended))
+        offset = int(8 * (1.0 - t))
+        coords = canvas.coords(lyrics_primary_label_id)
+        if len(coords) >= 2:
+            base_y = lyrics_layout_cache.get("primary_y", coords[1])
+            canvas.coords(lyrics_primary_label_id, coords[0], base_y + offset)
+    except tk.TclError:
+        lyric_transition_state["active"] = False
 
 
 def render_progress_bar(window_width: int, window_height: int) -> None:
@@ -2273,6 +2989,7 @@ def refresh_lyrics_display():
 
     # Cheap per-tick: advance the progress bar fill width.
     tick_progress_bar()
+    tick_lyric_transition()
 
     if lyrics_state.get("synced_lines"):
         interval_ms = max(100, int(config.get("lyrics", {}).get("refresh_interval_ms", 250)))
@@ -2319,6 +3036,8 @@ def set_status_message(message: str):
     if message != current_status_message:
          current_status_message = message
          logger.debug(f"Status updated: {message}")
+         if led_controller:
+             led_controller.set_state(classify_status_state(message))
          schedule_gui_update(update_status_display_text)
 
 def update_status_display_text():
@@ -2386,32 +3105,68 @@ def update_images() -> Dict[str, Any]:
         'is_fullscreen': is_fullscreen
     })
 
+    # Idle splash takeover — skip rest of layout when active.
+    global idle_splash_active
+    now_monotonic = time.monotonic()
+    # A persisted title is display state, not proof that music is still active.
+    # Repeated successful recognitions keep this recent; no-match cycles let it
+    # expire so the idle splash can return after playback stops.
+    has_active_track = bool(last_track_title) and has_recent_track(
+        last_recognition_monotonic,
+        now_monotonic,
+        config,
+    )
+    splash = should_show_idle_splash(
+        last_match_monotonic=last_recognition_monotonic,
+        now_monotonic=now_monotonic,
+        has_active_track=has_active_track,
+        cfg=config,
+    )
+    idle_splash_active = splash
+    if splash:
+        render_idle_splash(window_width, window_height)
+        layout_info["idle_splash"] = True
+        return layout_info
+    hide_idle_splash()
+
     image_file_path = IMAGE_PATH
     gui_cfg = config['gui']
     lyrics_cfg = config.get("lyrics", {})
 
-    global accent_color_hex
+    global accent_color_hex, led_color_hex
     brightness = 0.2  # With vignette, foreground is always over a darkened scrim.
     try:
         if image_file_path.is_file():
-            blurred_pil_image = create_blurred_background(
-                image_file_path, window_width, window_height, gui_cfg['blur_strength']
-            )
-            if blurred_pil_image:
-                # Extract accent BEFORE vignetting (color is truer pre-darken).
+            # Try Ken Burns crossfade first; fall back to static blurred bg.
+            installed_kb = install_ken_burns(image_file_path, window_width, window_height)
+            if installed_kb:
+                # Accent extract from a fresh pre-vignette frame for true colors.
                 try:
-                    accent_color_hex = extract_accent_color(blurred_pil_image)
+                    pre_vignette = create_blurred_background(
+                        image_file_path, window_width, window_height, gui_cfg['blur_strength']
+                    )
+                    if pre_vignette is not None:
+                        accent_color_hex = extract_accent_color(pre_vignette)
                 except Exception as e:
                     logger.debug(f"Accent extract failed: {e}")
-                vignette_intensity = safe_float(gui_cfg.get("vignette_intensity")) or 0.55
-                blurred_pil_image = apply_vignette(blurred_pil_image, intensity=vignette_intensity)
-                bg_photo_ref = ImageTk.PhotoImage(blurred_pil_image)
-                canvas.delete("background")
-                canvas.create_image(0, 0, anchor=tk.NW, image=bg_photo_ref, tags=("background",))
-                canvas.tag_lower("background")
             else:
-                canvas.delete("background")
-                bg_photo_ref = None
+                blurred_pil_image = create_blurred_background(
+                    image_file_path, window_width, window_height, gui_cfg['blur_strength']
+                )
+                if blurred_pil_image:
+                    try:
+                        accent_color_hex = extract_accent_color(blurred_pil_image)
+                    except Exception as e:
+                        logger.debug(f"Accent extract failed: {e}")
+                    vignette_intensity = safe_float(gui_cfg.get("vignette_intensity")) or 0.55
+                    blurred_pil_image = apply_vignette(blurred_pil_image, intensity=vignette_intensity)
+                    bg_photo_ref = ImageTk.PhotoImage(blurred_pil_image)
+                    canvas.delete("background")
+                    canvas.create_image(0, 0, anchor=tk.NW, image=bg_photo_ref, tags=("background",))
+                    canvas.tag_lower("background")
+                else:
+                    canvas.delete("background")
+                    bg_photo_ref = None
         else:
             canvas.delete("background")
             bg_photo_ref = None
@@ -2422,6 +3177,23 @@ def update_images() -> Dict[str, Any]:
         bg_photo_ref = None
         canvas.config(bg="#0a0a0c")
 
+    # LEDs use the original cover rather than the blurred GUI backdrop. Blur
+    # averages neighbouring hues and is the main cause of muted strip colors.
+    try:
+        if image_file_path.is_file():
+            with Image.open(image_file_path) as cover_image:
+                raw_led_color = extract_dominant_color(cover_image)
+            led_cfg = config.get("led", {})
+            saturation_multiplier = safe_float(led_cfg.get("saturation_multiplier"))
+            value_multiplier = safe_float(led_cfg.get("value_multiplier"))
+            if saturation_multiplier is None:
+                saturation_multiplier = 1.25
+            if value_multiplier is None:
+                value_multiplier = 1.0
+            led_color_hex = tune_led_color(raw_led_color, saturation_multiplier, value_multiplier)
+    except Exception as e:
+        logger.debug(f"LED color extraction failed: {e}")
+
     # With the vignette overlay, foreground sits over a dark scrim regardless of
     # cover-art brightness — so we lock to a dark-mode foreground palette.
     text_color = "#ffffff"
@@ -2429,18 +3201,21 @@ def update_images() -> Dict[str, Any]:
     tertiary_text_color = "#8b919c"
     layout_info['text_color'] = text_color
     layout_info['accent_color'] = accent_color_hex
+    if led_controller:
+        led_controller.set_track_color(led_color_hex)
 
     margin_ratio = safe_float(lyrics_cfg.get("panel_margin_ratio")) or 0.05
     panel_gap_ratio = safe_float(lyrics_cfg.get("panel_gap_ratio")) or 0.04
     outer_margin = max(20, int(min(window_width, window_height) * margin_ratio))
     panel_gap = max(16, int(window_width * panel_gap_ratio))
-    force_cinematic_mode = bool(lyrics_cfg.get("force_cinematic_mode", False))
-    fullscreen_implies_cinematic = bool(lyrics_cfg.get("fullscreen_implies_cinematic_mode", True))
-    cinematic_mode = bool(lyrics_cfg.get("enabled", True)) and (
-        force_cinematic_mode
-        or (fullscreen_implies_cinematic and bool(is_fullscreen))
-        or window_width >= int(window_height * 1.18)
+    layout_breakpoint = detect_layout_breakpoint(window_width, window_height)
+    cinematic_mode = should_use_cinematic_mode(
+        window_width,
+        window_height,
+        bool(is_fullscreen),
+        lyrics_cfg,
     )
+    layout_info['layout_breakpoint'] = layout_breakpoint
     layout_info['cinematic_mode'] = cinematic_mode
 
     if cinematic_mode:
@@ -2504,6 +3279,8 @@ def update_images() -> Dict[str, Any]:
                         tags=("coverart",)
                     )
                 canvas.tag_raise(coverart_item_id)
+                # Paint accent halo plate behind the cover art.
+                render_cover_halo(square_x, square_y, int(square_size))
         except Exception as e:
             logger.exception(f"Error loading/processing main cover art image {image_file_path}: {e}")
             if coverart_item_id:
@@ -2517,12 +3294,14 @@ def update_images() -> Dict[str, Any]:
         square_photo_ref = None
 
     if cinematic_mode:
-        main_font_size = max(18, min(34, int(window_width * 0.032)))
-        artist_font_size = max(12, int(main_font_size * 0.42))
-        status_font_size = max(10, int(main_font_size * 0.32))
-        lyrics_primary_font_size = max(24, min(58, int(window_width * 0.047)))
-        lyrics_secondary_font_size = max(18, int(lyrics_primary_font_size * 0.62))
-        lyrics_tertiary_font_size = max(16, int(lyrics_primary_font_size * 0.54))
+        type_scale = compute_type_scale(min(window_width, window_height))
+        main_font_size = type_scale["title"]
+        artist_font_size = type_scale["artist"]
+        status_font_size = type_scale["status_pill"]
+        lyrics_primary_font_size = type_scale["lyric_active"]
+        # Context lines target ~55% of active per spec (active = ~1.6× context).
+        lyrics_secondary_font_size = max(13, int(lyrics_primary_font_size * 0.55))
+        lyrics_tertiary_font_size = max(12, int(lyrics_primary_font_size * 0.48))
     else:
         base_font_size = gui_cfg['base_font_size']
         scale_factor = 0.045
@@ -2636,11 +3415,7 @@ def update_images() -> Dict[str, Any]:
         title_display_text = last_track_title
         album_text = last_album_name.strip()
         album_display_text = album_text
-        artist_display_text = last_artist_name
-        if cinematic_mode:
-            title_display_text = f"♩ {last_track_title}" if last_track_title else ""
-            album_display_text = f"◎ {album_text}" if album_text else ""
-            artist_display_text = f"◌ {last_artist_name}" if last_artist_name else ""
+        artist_display_text = format_artist_label(last_artist_name)
 
         title_label_id, title_font_obj, title_bbox = fit_canvas_title_font(
             canvas,
@@ -2657,35 +3432,75 @@ def update_images() -> Dict[str, Any]:
             title_max_height,
         )
         title_block_bottom = title_bbox[3]
-        title_to_album_gap = 8 if cinematic_mode else max(4, int(album_line_height * 0.35))
-        album_to_artist_gap = 8 if cinematic_mode else max(4, int(artist_line_height * 0.2))
-        artist_to_status_gap = 12 if cinematic_mode else max(6, int(status_line_height * 0.45))
 
+        # Equal spacing between every meta line (title / album / artist).
+        # Status pill gets a slightly larger gap so the supporting chrome
+        # reads as a distinct row rather than another meta line.
+        meta_line_gap = max(8, int(artist_line_height * 0.5))
+        title_to_album_gap = meta_line_gap
+        album_to_artist_gap = meta_line_gap
+        artist_to_status_gap = max(meta_line_gap, int(status_line_height * 0.9))
+
+        # Render album using fit_canvas_title_font so we get word-fit protection
+        # and a true bbox; stack the next line from that bbox bottom.
+        album_min_size = max(8, int(album_font_obj.cget("size") if hasattr(album_font_obj, 'cget') else max(10, int(artist_font_size * 0.85))) - 1)
+        album_max_height = max(album_line_height * 3, int(metadata_width * 0.4))
         album_y = title_block_bottom + title_to_album_gap
         if album_text:
-            artist_y = album_y + album_line_height + album_to_artist_gap
+            album_label_id, _, album_bbox = fit_canvas_title_font(
+                canvas,
+                album_label_id,
+                album_display_text,
+                main_text_x,
+                album_y,
+                metadata_width,
+                secondary_text_color,
+                metadata_anchor,
+                metadata_justify,
+                max(10, int(artist_font_size * 0.95)),
+                album_min_size,
+                album_max_height,
+                weight="normal",
+                slant="italic",
+            )
+            album_block_bottom = album_bbox[3]
         else:
-            artist_y = title_block_bottom + title_to_album_gap
-        status_y = artist_y + artist_line_height + artist_to_status_gap
+            # Hide the album label (empty text, zero height) when no album.
+            if album_label_id:
+                try:
+                    canvas.itemconfigure(album_label_id, text="")
+                except tk.TclError:
+                    album_label_id = None
+            album_block_bottom = title_block_bottom
+
+        artist_y = album_block_bottom + album_to_artist_gap
+        artist_min_size = max(8, int(artist_font_size * 0.7))
+        artist_max_height = max(artist_line_height * 3, int(metadata_width * 0.5))
+        artist_label_id, _, artist_bbox = fit_canvas_title_font(
+            canvas,
+            artist_label_id,
+            artist_display_text,
+            main_text_x,
+            artist_y,
+            metadata_width,
+            secondary_text_color,
+            metadata_anchor,
+            metadata_justify,
+            artist_font_size,
+            artist_min_size,
+            artist_max_height,
+            weight="normal",
+        )
+        artist_block_bottom = artist_bbox[3]
+        status_y = artist_block_bottom + artist_to_status_gap
 
         layout_info.update({
             'title_y': title_y,
             'album_y': album_y,
             'artist_y': artist_y,
             'status_y': status_y,
+            'meta_block_bottom': status_y,
         })
-
-        if album_label_id:
-            canvas.coords(album_label_id, main_text_x, album_y)
-            canvas.itemconfigure(album_label_id, text=album_display_text, font=album_font_obj, fill=secondary_text_color, anchor=metadata_anchor, justify=metadata_justify, width=metadata_width)
-        else:
-            album_label_id = canvas.create_text(main_text_x, album_y, text=album_display_text, font=album_font_obj, tags=("main_text",), fill=secondary_text_color, anchor=metadata_anchor, justify=metadata_justify, width=metadata_width)
-
-        if artist_label_id:
-            canvas.coords(artist_label_id, main_text_x, artist_y)
-            canvas.itemconfigure(artist_label_id, text=artist_display_text, font=artist_font_obj, fill=secondary_text_color, anchor=metadata_anchor, justify=metadata_justify, width=metadata_width)
-        else:
-            artist_label_id = canvas.create_text(main_text_x, artist_y, text=artist_display_text, font=artist_font_obj, tags=("main_text",), fill=secondary_text_color, anchor=metadata_anchor, justify=metadata_justify, width=metadata_width)
 
         # Status now renders as a pill (rounded surface + animated dot + label)
         # anchored at the same status_y position, instead of plain canvas text.
@@ -2698,11 +3513,38 @@ def update_images() -> Dict[str, Any]:
 
         canvas.delete("metadata_icon")
 
+        # In stacked layout the meta block sits between the cover and lyrics —
+        # if title/album/artist grew taller than expected, push the lyrics
+        # column down so it never overlaps the metadata. In cinematic mode the
+        # two columns are side-by-side, but we still apply a soft floor so a
+        # very wrapped left column can't intrude on the right side's vertical
+        # band.
+        meta_block_bottom_px = layout_info.get("meta_block_bottom", status_y) + status_line_height
+        # Status pill adds a rounded surface that extends slightly below the
+        # label baseline — reserve that here too.
+        meta_block_bottom_px += max(8, int(status_font_size * 0.6))
+        if not cinematic_mode:
+            lyric_gap = max(20, int(window_height * 0.025))
+            new_primary_y = meta_block_bottom_px + lyric_gap
+            if new_primary_y > lyrics_layout_cache.get("primary_y", 0):
+                lyrics_layout_cache["primary_y"] = new_primary_y
+
         render_lyrics_labels()
         render_progress_bar(window_width, window_height)
-        canvas.tag_raise("main_text")
-        canvas.tag_raise("status_pill")
-        canvas.tag_raise("progress_bar")
+        try:
+            canvas.tag_lower("background")
+            canvas.tag_raise("cover_halo", "background")
+            if coverart_item_id:
+                canvas.tag_raise(coverart_item_id, "cover_halo")
+            canvas.tag_raise("main_text")
+            canvas.tag_raise("lyrics_text")
+            canvas.tag_raise("progress_bar")
+            canvas.tag_raise("status_pill")
+            if idle_splash_active:
+                canvas.tag_raise("idle_splash")
+                canvas.tag_raise("status_pill")
+        except tk.TclError:
+            pass
     except tk.TclError as e:
         logger.warning(f"TclError updating text labels: {e}. IDs reset.")
         global status_pill_bg_id, status_pill_dot_id, progress_bar_track_id, progress_bar_fill_id
@@ -2771,6 +3613,10 @@ def redraw_history_display(layout_info: Dict[str, Any]):
             logger.info("--- History Redraw End (No cinematic history entries after current track) ---")
             return
 
+        # Recent strip uses a single foreground color for every item — the
+        # progressive fade read as "broken UI" more than visual hierarchy.
+        recent_title_color = text_color
+        recent_artist_color = "#cdd2da"
         for index, item in enumerate(items_to_draw):
             img_path_str = item.get('image_path')
             if not img_path_str:
@@ -2806,7 +3652,7 @@ def redraw_history_display(layout_info: Dict[str, Any]):
                         text_x,
                         title_y,
                         history_text_width,
-                        text_color,
+                        recent_title_color,
                         tk.NW,
                         tk.LEFT,
                         history_title_font_size,
@@ -2826,7 +3672,7 @@ def redraw_history_display(layout_info: Dict[str, Any]):
                         justify=tk.LEFT,
                         width=history_text_width,
                         font=history_artist_font,
-                        fill=text_color,
+                        fill=recent_artist_color,
                         tags=("history_item", "history_text", "history_artist")
                     )
                     history_photo_refs.append({
@@ -3127,6 +3973,9 @@ def update_gui(update_data: Dict[str, Any]):
     elif status == 'no_match':
         logger.info("GUI update: No match found.")
         status_to_set = "No Match Found"
+        # Re-evaluate idle timing on every no-match cycle so a persisted title
+        # cannot prevent the splash from returning after playback stops.
+        redraw_needed = True
 
     elif status == 'error':
         logger.error(f"GUI update: Received error status. Message: '{error_message}'")
@@ -3289,6 +4138,8 @@ def on_closing():
     logger.info("Shutdown requested via window close.")
 
     set_status_message("Shutting down...")
+    if led_controller:
+        led_controller.close()
 
     if root and root.winfo_exists() and lyrics_update_job_id:
         try:
@@ -3334,7 +4185,10 @@ async def process_recognition_result(
     record_start_monotonic: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Processes successful Shazam result: cache/download image, add to history, save state."""
-    global song_history_list
+    global song_history_list, last_recognition_monotonic
+    last_recognition_monotonic = time.monotonic()
+    previous_track_key = build_track_key(last_track_title, last_artist_name) if last_track_title else None
+    previous_accent = accent_color_hex
     track_info = result.get('track', {})
     new_title = track_info.get('title', 'Unknown Title')
     new_artist = track_info.get('subtitle', 'Unknown Artist')
@@ -3470,6 +4324,9 @@ async def process_recognition_result(
     path_to_save = persistent_path_for_this_song if cache_hit else final_persistent_path
     save_last_state(new_title, new_artist, new_album, path_to_save)
     prepare_lyrics_for_track(result, new_title, new_artist, record_start_monotonic)
+    new_track_key = build_track_key(new_title, new_artist)
+    if previous_track_key and new_track_key != previous_track_key:
+        schedule_gui_update(begin_track_change_choreography, previous_accent)
 
     return {
         'status': 'success',
@@ -3667,10 +4524,11 @@ def write_history_separator():
 
 
 def main():
-    global root, canvas, config, title_label_id, album_label_id, artist_label_id, status_label_id, coverart_item_id
+    global root, canvas, config, led_controller, title_label_id, album_label_id, artist_label_id, status_label_id, coverart_item_id
     global lyrics_primary_label_id, lyrics_secondary_label_id, lyrics_tertiary_label_id
 
     config = load_config()
+    led_controller = LedController(config.get("led"))
     logger.info("--- Song Recognition Application Starting ---")
     global lyrics_cache
     lyrics_cache = load_lyrics_cache()
@@ -3728,6 +4586,8 @@ def main():
     root.after(100, trigger_full_redraw)
     root.after(100, reset_cursor_hide_timer)
     root.after(300, tick_status_pulse)
+    root.after(400, tick_lyric_glow)
+    root.after(600, tick_ken_burns)
 
     start_recognition_thread()
 
