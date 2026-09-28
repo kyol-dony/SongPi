@@ -29,7 +29,7 @@ lyrics_cache.json
 # Superpowers / brainstorming scratch
 .superpowers/
 **/.superpowers/
-docs/superpowers/
+docs/
 .claude/cache/
 **/.claude/cache/
 
