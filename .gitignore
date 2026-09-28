@@ -33,6 +33,9 @@ docs/
 .claude/cache/
 **/.claude/cache/
 
+# Graphify generated knowledge graph
+graphify-out/
+
 # OS cruft
 .DS_Store
 
