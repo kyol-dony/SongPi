@@ -44,3 +44,37 @@ Double click the 'Start.bat' file.
 Tip: If the `.sh` files aren't executable, run `chmod +x setup_macos.sh run_macos.sh` once.
 
 Cheers.
+
+## Album-color LED strip (Arduino Uno + WS2812B)
+
+SongPi can mirror the cover-art accent color across a WS2812B strip. Open the
+`Arduino/SongPiLedStrip` folder as a PlatformIO project and build/upload the
+`uno` environment; FastLED is installed automatically from `platformio.ini`.
+Then set `led.enabled` to `true` and `led.port` to your board's serial port in
+`Files/config.json` (`COM3` on Windows or `/dev/cu.usbmodem…` on macOS).
+
+The sketch defaults to 30 LEDs on Arduino digital pin 6. If your setup differs,
+change both the sketch constants and matching config values. `brightness` is
+0–255 and deliberately defaults to 96 to limit power draw.
+
+The firmware has a hard `MAX_POWER_MILLIAMPS` limit of **400 mA at 5 V** in
+`Arduino/SongPiLedStrip/src/main.cpp`. FastLED automatically scales every
+output frame to remain within that budget, even if SongPi requests a higher
+brightness. Do not increase this value beyond the external supply's continuous
+current rating.
+
+`led.saturation_multiplier` controls the hardware-only color boost (default
+`1.25`): increase it gradually up to `1.6` for more vivid strips, or set it to
+`1.0` for the extracted color unchanged. `led.value_multiplier` can brighten
+or dim the selected color independently of the strip's global `brightness`.
+`led.reset_delay_seconds` defaults to `2.0` so SongPi waits for an Uno reboot
+after opening USB serial before it sends the initial color command.
+
+Wire Arduino D6 to strip DIN through a 330–470 ohm resistor, and connect Arduino
+GND to the strip power-supply GND. Power the strip from a suitable external 5 V
+supply (not the Uno's 5 V pin); add a ~1000 uF capacitor across the strip supply
+near its input. Never omit the shared ground.
+
+SongPi sends `COLOR r g b` when artwork changes and sends a `STATE` command as
+its recognition state changes. The firmware currently keeps album color solid;
+its `STATE` handler is the extension point for future reactions.

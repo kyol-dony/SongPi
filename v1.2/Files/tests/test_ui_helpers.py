@@ -70,6 +70,43 @@ def test_simulate_alpha_on_dark_low_opacity_blends_to_scrim():
     assert result == "#0a0a0c"
 
 
+def test_tune_led_color_increases_saturation_without_changing_hue_family():
+    tuned = shazam.tune_led_color("#c08080", saturation_multiplier=1.5)
+    red, green, blue = shazam.hex_to_rgb(tuned)
+    assert red > green == blue
+    assert green < 128
+
+
+def test_tune_led_color_leaves_gray_untinted():
+    assert shazam.tune_led_color("#808080", saturation_multiplier=2.0) == "#808080"
+
+
+def _solid_with_patch(bg_rgb, patch_rgb, patch_box=(90, 90, 110, 110), size=(200, 200)):
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", size, bg_rgb)
+    ImageDraw.Draw(img).rectangle(patch_box, fill=patch_rgb)
+    return img
+
+
+def test_extract_dominant_color_picks_majority_over_vivid_minority():
+    # Near-white background (96%) with a small vivid green patch (4%).
+    img = _solid_with_patch((245, 245, 240), (0, 150, 80))
+    assert shazam.hex_to_rgb(shazam.extract_dominant_color(img)) == (245, 245, 240)
+
+
+def test_extract_dominant_color_skips_black_for_next_most_used_color():
+    # Black background (96%) should fall through to the red patch (4%)
+    # rather than turning the LED strip off.
+    img = _solid_with_patch((10, 10, 10), (220, 20, 20))
+    assert shazam.hex_to_rgb(shazam.extract_dominant_color(img)) == (220, 20, 20)
+
+
+def test_extract_dominant_color_returns_black_when_nothing_else_available():
+    from PIL import Image
+    img = Image.new("RGB", (200, 200), (5, 5, 5))
+    assert shazam.hex_to_rgb(shazam.extract_dominant_color(img)) == (5, 5, 5)
+
+
 def test_breakpoint_wide_at_1920x1080():
     assert shazam.detect_layout_breakpoint(1920, 1080) == "wide"
 

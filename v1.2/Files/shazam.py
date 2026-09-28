@@ -12,6 +12,7 @@ import io
 import os
 import json
 import math
+import colorsys
 import re
 import unicodedata
 from screeninfo import get_monitors
@@ -24,6 +25,7 @@ import sys
 import time
 from typing import Optional, Dict, Any, Tuple, List, Literal, Union
 from pathlib import Path
+from led_controller import LedController
 
 # Only set ALSA hint on Linux (avoids breaking macOS/Windows)
 if sys.platform.startswith("linux"):
@@ -61,6 +63,7 @@ MIN_WINDOW_HEIGHT = 200
 
 # --- Global State ---
 config: Dict[str, Any] = {}
+led_controller: Optional[LedController] = None
 root: Optional[tk.Tk] = None
 canvas: Optional[tk.Canvas] = None
 title_label_id: Optional[int] = None
@@ -79,6 +82,7 @@ cover_halo_photo_ref: Optional["ImageTk.PhotoImage"] = None
 cover_halo_item_id: Optional[int] = None
 
 accent_color_hex: str = "#7c8fff"   # Cover-art derived accent; updated per track.
+led_color_hex: str = "#7c8fff"      # Hardware color; sampled from the unblurred cover.
 ui_font_family_cache: Optional[str] = None
 status_pulse_phase: float = 0.0
 status_pulse_job_id: Optional[str] = None
@@ -193,6 +197,12 @@ def load_config() -> Dict[str, Any]:
             "accent_halo_intensity": 0.35,
         },
         "network": {"timeout": 7, "retry_count": 3, "retry_delay": 2},
+        "led": {
+            "enabled": False, "port": "", "baud_rate": 115200,
+            "brightness": 96, "pixel_count": 30, "data_pin": 6,
+            "saturation_multiplier": 1.25, "value_multiplier": 1.0,
+            "reset_delay_seconds": 2.0,
+        },
         "lyrics": {
             "enabled": True,
             "show_plain_lyrics": False,
@@ -693,6 +703,61 @@ def extract_accent_color(image: Image.Image) -> str:
     except Exception as e:
         logger.debug(f"Accent extraction failed: {e}")
         return "#7c8fff"
+
+
+NEAR_BLACK_MAX_CHANNEL = 40  # Matches extract_accent_color's near-black cutoff.
+
+
+def extract_dominant_color(image: Image.Image) -> str:
+    """Returns the cover art's true dominant color, by pixel population.
+
+    Unlike extract_accent_color (which deliberately discards near-black/
+    near-white buckets and biases toward saturated colors so the UI gets a
+    pleasant accent), this reports whatever color actually covers the most
+    pixels — including muted or near-white dominants. That's what the LED
+    strip should reproduce to match the album art.
+
+    Near-black is the one exception: a black-dominant cover (common for
+    minimalist/dark album art) would otherwise just turn the strip off, so
+    the next most-populous non-black bucket is used instead. If every
+    bucket is near-black, black wins anyway — there's no better option.
+    """
+    try:
+        thumb = image.convert("RGB").resize((96, 96), Image.Resampling.BILINEAR)
+        quant = thumb.quantize(colors=8, method=Image.Quantize.MEDIANCUT)
+        palette = quant.getpalette() or []
+        counts = sorted(quant.getcolors() or [], reverse=True)
+        if not counts:
+            return "#7c8fff"
+        for _, idx in counts:
+            r = palette[idx * 3 + 0]
+            g = palette[idx * 3 + 1]
+            b = palette[idx * 3 + 2]
+            if max(r, g, b) >= NEAR_BLACK_MAX_CHANNEL:
+                return rgb_to_hex((r, g, b))
+        _, idx = counts[0]
+        r = palette[idx * 3 + 0]
+        g = palette[idx * 3 + 1]
+        b = palette[idx * 3 + 2]
+        return rgb_to_hex((r, g, b))
+    except Exception as e:
+        logger.debug(f"Dominant color extraction failed: {e}")
+        return "#7c8fff"
+
+
+def tune_led_color(color: str, saturation_multiplier: float = 1.25,
+                   value_multiplier: float = 1.0) -> str:
+    """Increase LED saturation/value without shifting the cover's hue.
+
+    The UI accent remains untouched. This hardware-only transform compensates
+    for the muted appearance common to WS2812B strips at safe brightness.
+    """
+    red, green, blue = hex_to_rgb(color)
+    hue, saturation, value = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue / 255.0)
+    saturation = max(0.0, min(1.0, saturation * max(0.0, saturation_multiplier)))
+    value = max(0.0, min(1.0, value * max(0.0, value_multiplier)))
+    tuned = colorsys.hsv_to_rgb(hue, saturation, value)
+    return rgb_to_hex(tuple(int(channel * 255) for channel in tuned))
 
 
 def apply_vignette(image: Image.Image, intensity: float = 0.55) -> Image.Image:
@@ -2935,6 +3000,8 @@ def set_status_message(message: str):
     if message != current_status_message:
          current_status_message = message
          logger.debug(f"Status updated: {message}")
+         if led_controller:
+             led_controller.set_state(classify_status_state(message))
          schedule_gui_update(update_status_display_text)
 
 def update_status_display_text():
@@ -3022,7 +3089,7 @@ def update_images() -> Dict[str, Any]:
     gui_cfg = config['gui']
     lyrics_cfg = config.get("lyrics", {})
 
-    global accent_color_hex
+    global accent_color_hex, led_color_hex
     brightness = 0.2  # With vignette, foreground is always over a darkened scrim.
     try:
         if image_file_path.is_file():
@@ -3066,6 +3133,23 @@ def update_images() -> Dict[str, Any]:
         bg_photo_ref = None
         canvas.config(bg="#0a0a0c")
 
+    # LEDs use the original cover rather than the blurred GUI backdrop. Blur
+    # averages neighbouring hues and is the main cause of muted strip colors.
+    try:
+        if image_file_path.is_file():
+            with Image.open(image_file_path) as cover_image:
+                raw_led_color = extract_dominant_color(cover_image)
+            led_cfg = config.get("led", {})
+            saturation_multiplier = safe_float(led_cfg.get("saturation_multiplier"))
+            value_multiplier = safe_float(led_cfg.get("value_multiplier"))
+            if saturation_multiplier is None:
+                saturation_multiplier = 1.25
+            if value_multiplier is None:
+                value_multiplier = 1.0
+            led_color_hex = tune_led_color(raw_led_color, saturation_multiplier, value_multiplier)
+    except Exception as e:
+        logger.debug(f"LED color extraction failed: {e}")
+
     # With the vignette overlay, foreground sits over a dark scrim regardless of
     # cover-art brightness — so we lock to a dark-mode foreground palette.
     text_color = "#ffffff"
@@ -3073,6 +3157,8 @@ def update_images() -> Dict[str, Any]:
     tertiary_text_color = "#8b919c"
     layout_info['text_color'] = text_color
     layout_info['accent_color'] = accent_color_hex
+    if led_controller:
+        led_controller.set_track_color(led_color_hex)
 
     margin_ratio = safe_float(lyrics_cfg.get("panel_margin_ratio")) or 0.05
     panel_gap_ratio = safe_float(lyrics_cfg.get("panel_gap_ratio")) or 0.04
@@ -4004,6 +4090,8 @@ def on_closing():
     logger.info("Shutdown requested via window close.")
 
     set_status_message("Shutting down...")
+    if led_controller:
+        led_controller.close()
 
     if root and root.winfo_exists() and lyrics_update_job_id:
         try:
@@ -4388,10 +4476,11 @@ def write_history_separator():
 
 
 def main():
-    global root, canvas, config, title_label_id, album_label_id, artist_label_id, status_label_id, coverart_item_id
+    global root, canvas, config, led_controller, title_label_id, album_label_id, artist_label_id, status_label_id, coverart_item_id
     global lyrics_primary_label_id, lyrics_secondary_label_id, lyrics_tertiary_label_id
 
     config = load_config()
+    led_controller = LedController(config.get("led"))
     logger.info("--- Song Recognition Application Starting ---")
     global lyrics_cache
     lyrics_cache = load_lyrics_cache()
