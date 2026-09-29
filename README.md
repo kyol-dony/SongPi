@@ -1,117 +1,262 @@
 # SongPi - Automatic Song Recognition & Visualiser
 
-SongPi is a Python application that listens to audio playing around your computer (or through a specified microphone), automatically identifies the song, and displays its title, artist, and cover art in a sleek, dynamic interface. It uses Shazamio for the core recognition functionality and Tkinter for the graphical user interface.
+SongPi is a Python desktop app that listens to the music playing around you, identifies it with Shazam, and turns your screen into a living "now playing" display: full-bleed album art, time-synced lyrics that scroll along with the song, a history of recent tracks, and (optionally) an Arduino LED strip that glows in the colour of the current album.
 
-## How It Works
+It runs on Windows, macOS, and Linux (including Raspberry Pi), and is designed to sit fullscreen on a spare monitor, TV, or wall display.
 
-1.  **Audio Capture:** SongPi records a short audio snippet (typically a few seconds) from your computer's selected audio input device. The recording parameters like duration, sample rate, and device can be configured.
-2.  **Recognition:** The captured audio is sent to Shazam (via the Shazamio library) to identify the song.
-3.  **Information Retrieval:** If a match is found, the application fetches metadata including the song's title, artist, and URLs for the cover art.
-4.  **Dynamic Display:**
-    * The cover art is displayed prominently, with a larger, blurred version of it serving as the window background.
-    * The song title and artist are overlaid on the display.
-    * Text colour (black or white) is dynamically chosen based on the background's brightness to ensure readability.
-5.  **Continuous Operation:** The app periodically repeats this process, automatically updating the display if a new song is detected.
-
-Examples:
-![Landscape view 1](readme_images/Landscape_bright.png)
-![Landscape view 2](readme_images/Landscape_dark.png)
-![Portrait view](readme_images/Portrait.png)
-
-## Key Features
-
-* **Automatic Song Identification:** "Always-on" recognition that listens for music and updates the display in real-time.
-* **Immersive Visuals:**
-    * Fullscreen (or windowed) display focusing on the current song's album art.
-    * Blurred album art background for an aesthetic look.
-    * Adaptive text colouring ensures song title and artist are always clear.
-    * Font sizes adjust dynamically for optimal viewing based on window size.
-* **Song History:**
-    * Keeps track of recently identified songs and displays them in a history panel.
-    * **Smart Layout:** The history panel intelligently positions itself:
-        * To the **left** of the main cover art in wider (landscape) windows.
-        * **Below** the main song details in taller (portrait) windows or when side space is limited.
-    * Cover art for history items is cached locally for quick access and to minimise downloads.
-    * A persistent text log (`song_history.log`) is maintained in the application's root directory, recording the timestamp, artist, and title of each recognised song.
-    * Manages disk space by automatically cleaning up older cached history images.
-* **State Persistence:**
-    * Remembers the last successfully identified song (including its title, artist, and cover art path).
-    * Restores and displays this last known song when the application starts up.
-* **Audio Input Management:**
-    * Allows manual selection of the audio input device index via `config.json`.
-    * If no device is specified or the configured one is invalid, SongPi attempts to auto-select a suitable input device.
-* **User Interface Controls:**
-    * Toggle between fullscreen and windowed mode by pressing the `Esc` key.
-    * The mouse cursor automatically hides after a few seconds of inactivity and reappears on movement.
-* **Highly Configurable:**
-    * Many aspects of the application's behaviour can be customised through the `config.json` file located in the `Files` directory.
-    * Settings include audio recording parameters (format, channels, sample rate, chunk size, record seconds, device index), GUI update interval, blur strength, font sizes, history panel appearance (max items, art size, padding, offsets), network settings (timeout, retry count, retry delay), and logging preferences.
-
-## Running **SongPi** on Windows
-
-* Ensure you have Python installed (recommended version 3.8+), and have selected the PATH option when installing.
-* Download the latest release of **SongPi** and extract the .zip file.
-* Click the `Setup.bat` script to launch the setup process that creates a new Python virtual environment and downloads the required dependencies (via `requirements.txt`) thru PIP.
-* Once the setup script is done, click on `SongPi.py` and the app will launch, play some music to start the recognition!
-
-## Running **SongPi** on macOS
-
-1. Install Python 3.12 (python.org pkg or `brew install python@3.12`).
-2. If PyAudio build fails: `brew install portaudio`, then rerun setup.
-3. From `SongPi_full_Windows`, create the venv and install deps:
-    ```
-    rm -rf Files/venv
-    PYTHON_BIN=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 ./setup_macos.sh
-    
-    # Homebrew 3.12 alternative:
-    PATH="/opt/homebrew/opt/python@3.12/bin:$PATH" PYTHON_BIN=python3.12 ./setup_macos.sh
-    ```
-4. Launch anytime with:
-    ```
-    ./run_macos.sh
-    ```
-5. Audio input: leave `audio.device_index` as `null` in `Files/config.json` to auto-select, or set a specific index after checking the console device list.
-6. Dependencies: `shazamio==0.7.0` (pure Python) and `numpy==2.1.2` assume Python 3.12 wheels. Python 3.14 will try to compile numpy and fail—stay on 3.12.
-7. If you hit a segfault importing `shazamio_core` or a numpy build error, delete `Files/venv` and rerun the setup commands above.
-
-
-## Running **SongPi** on Linux
-
-1.  **Python:** Ensure you have Python installed (recommended version 3.8+).
-2.  **Dependencies:** Install the required Python packages listed in `requirements.txt`, this can be installed by navigating to the same directory in terminal and running the following:
-    ```bash
-    pip install -r requirements.txt
-    ```
-    Key dependencies include: `pyaudio`, `shazamio`, `requests`, `Pillow`, `screeninfo`.
-3.  **Audio Input:** Make sure your PC has a working microphone or an audio input source that can capture the music you want to identify. For identifying system audio directly, you might need to configure a loopback device (like "Stereo Mix" on Windows or using software like VB-Cable).
-4.  **Configuration (Optional):**
-    * Before first run, you can review and modify `config.json` if you want to change anything (the default settings have worked fine in my testing).
-    * You might want to set `audio.device_index` if you know which input device you want to use. If left as `null`, the application will try to pick one.
-
-
-## Troubleshooting
-
-* **No Audio Devices Found / Cannot Open Device:**
-    * Ensure your microphone/input device is properly connected and enabled in your system settings.
-    * Check the `audio.device_index` in `config.json`. Try setting it to `null` to let the app auto-select, or use a tool to list audio devices and find the correct index for your desired input. The application logs available devices if it fails to find a suitable one.
-* **Recognition Fails:**
-    * Ensure the audio is clear and loud enough.
-    * Check your internet connection, as recognition requires communication with Shazam's servers.
-    * Look at the application logs or console output for error messages from Shazamio or network requests.
+![Fullscreen cinematic layout](readme_images/JVB_fullscreen.png)
+![Fullscreen cinematic layout 2](readme_images/divorced-aussie-dad-tunes_fullscreen.png)
+![Windowed layout](readme_images/banger_windowed.png)
+![Windowed layout 2](readme_images/Oshun-El-eee_windowed.png)
 
 ---
 
-## What's New in v1.2 (Latest Version)
+## How It Works
 
-Version 1.1 introduces significant enhancements over previous versions, focusing on user experience, reliability, and new functionalities:
+1. **Listen.** SongPi records a short clip from your microphone or audio input. If Shazam doesn't find a match, it tries again in the same cycle with a longer recording.
+2. **Recognise.** The clip is sent to Shazam (via the [`shazamio`](https://github.com/shazamio/ShazamIO) library), which returns the title, artist, album, cover art, and how far into the song the clip was.
+3. **Style.** The cover art is downloaded, and SongPi pulls a dominant accent colour from it. That colour tints the lyrics, progress bar, status pill, halo, and the LED strip.
+4. **Fetch lyrics.** Time-synced lyrics are looked up on [LRCLIB](https://lrclib.net), with NetEase as a fallback, and cached on disk.
+5. **Display.** The song, lyrics, and history are rendered on a blurred, slowly drifting copy of the album art. The lyric clock is anchored to the moment the audio was captured, so lyrics stay in time with the music.
+6. **Repeat.** SongPi keeps listening and updates the display when the song changes.
 
-* **Revamped Song History:**
-    * Visually displays a list of recently recognised songs within the app.
-    * Intelligently adapts its layout (side or below main info) based on window dimensions.
-    * Caches cover art for history items and maintains a persistent `.log` file of all recognised tracks.
-* **State Persistence:** The app now remembers the last identified song and restores it upon restarting.
-* **Smarter Audio Device Handling:** Includes improved automatic selection of audio input devices if not explicitly configured or if the set device is invalid.
-* **Enhanced Visuals & Layout:** More dynamic font scaling and more robust GUI updates. Placeholder images are shown if cover art is unavailable.
-* **Expanded Configuration:** More options in `config.json` to customise the history panel, logging behaviour, and more.
-* **Improved Reliability:** Features comprehensive logging for easier troubleshooting, a more graceful shutdown process, and safer file operations.
-* **Code Quality:** Significant code refactoring for better readability, maintainability, and the introduction of type hinting.
+---
+
+## Features
+
+### Recognition
+- **Always-on listening:** SongPi recognises songs continuously and updates the display on its own.
+- **Retry with longer capture:** each cycle can record more than once, and retries can use a longer clip, so quiet or late-starting music is still caught.
+- **Robust audio handling:** input overflows, closed streams, and empty recordings are handled without crashing.
+- **Automatic input selection:** leave `device_index` as `null` and SongPi picks a working input device on its own.
+
+### Time-synced lyrics
+- **Multiple sources:** LRCLIB first, using several search strategies and a scoring system to pick the best match. A NetEase lyrics mirror is used as a fallback.
+- **Smart matching:** titles and artists are cleaned up before searching. "feat.", "remix", bracketed text, and accents are stripped so more songs find lyrics.
+- **Accurate sync:**
+  - Playback position is anchored to when the audio was *recorded*, not when Shazam replied.
+  - LRC `[offset:]` tags are respected.
+  - Repeated recognitions of the same song are smoothed so the lyrics don't jump around.
+- **On-disk lyrics cache:** found lyrics are kept for 30 days. Misses are retried after an hour.
+- **Fallback:** plain (unsynced) lyrics can be shown if no timed lyrics exist.
+
+### Cinematic display
+- **Cinematic layout:** in fullscreen or wide windows, the cover art sits bottom-left, track details sit beside it, lyrics fill the right side, and recent album covers stack above.
+- **Responsive layout:** the screen switches between *wide*, *mid*, and *stacked* layouts based on window size and shape. Type sizes scale to match, so it looks right on a 7" Pi screen and a 4K TV alike.
+- **Album-driven colour:**
+  - Each song's accent colour tints the active lyric line, the progress bar, and a soft halo behind the cover art.
+  - A radial vignette keeps text readable on any artwork.
+- **Motion and polish:**
+  - The blurred backdrop slowly pans and zooms ("Ken Burns" effect) and crossfades when the song changes.
+  - The accent colour crossfades between tracks.
+  - The active lyric line gently "breathes" with a glow.
+  - Lyrics slide and fade as they advance.
+- **Status pill:** a rounded indicator with a coloured, pulsing dot shows what SongPi is doing: starting, listening, recognising, ready, no match, or error.
+- **Idle splash:** when nothing has been recognised for a while, the display fades to an animated gradient with the SongPi wordmark instead of showing a stale song.
+- **Clean typography:**
+  - Inter font where available, with fallbacks.
+  - Artist names are shown uppercase and letter-spaced.
+  - Long titles, albums, and artist names shrink and wrap at word boundaries instead of overlapping or breaking mid-word.
+- **Low-power mode:** on Raspberry Pi-class hardware (ARMv7, 4 cores or fewer), heavy animation is turned off automatically. You can also force this with `gui.motion_reduced`.
+
+### History and persistence
+- **Recent tracks panel:** recently identified songs are shown with thumbnails. They sit beside the main art in landscape windows, below it in portrait, and stacked above the cover in cinematic mode.
+- **Survives restarts:**
+  - The history list is saved to `Files/history_state.json`.
+  - The last song is saved to `Files/last_state.json`.
+  - Both are restored on startup, so the screen never comes up empty.
+- **Play log:** every recognised song is appended to `song_history.log` with a timestamp.
+- **Tidy disk usage:** cached cover art is cleaned up automatically. `history_max_items_retain` sets how many covers are kept.
+
+### Album-colour LED strip (optional)
+- A WS2812B LED strip driven by an Arduino Uno glows in the current album's accent colour.
+- It fades smoothly (about 1 second) between colours when the song changes.
+- The firmware enforces a hard power cap (400 mA at 5 V) to protect your power supply.
+- Saturation and brightness boosts can be tuned for more vivid strips.
+- See [LED strip setup](#led-strip-setup-optional) below.
+
+### Controls
+- **`Esc`**: switch between fullscreen and windowed mode. Windows can be freely resized.
+- **Mouse cursor**: hides automatically after a few seconds of inactivity.
+
+---
+
+## Getting Started
+
+The current version lives in the **`v1.3/`** folder. All commands below are run from there.
+
+> **Python 3.12 is strongly recommended.** SongPi relies on specific versions of `shazamio` (0.7.0) and `numpy` (2.1.2) that are only reliable on 3.12. Newer Python versions can crash or fail to install.
+
+### Windows
+1. Install [Python 3.12](https://www.python.org/downloads/release/python-3123/). **Tick "Add python.exe to PATH"** during install.
+2. Double-click **`1st time setup.bat`**. It creates a virtual environment in `Files\venv` and installs everything.
+3. Double-click **`Start.bat`** to launch SongPi. Use `Start.bat` every time after that.
+4. Play some music!
+
+### macOS
+1. Install Python 3.12 (from the [python.org installer](https://www.python.org/downloads/) or `brew install python@3.12`).
+2. If PyAudio fails to build, run `brew install portaudio` and try again.
+3. From the `v1.3` folder, run setup:
+   ```bash
+   ./setup_macos.sh
+   ```
+   The script looks for Python 3.12 automatically. To point it at a specific interpreter:
+   ```bash
+   PYTHON_BIN=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 ./setup_macos.sh
+   ```
+4. Launch any time with:
+   ```bash
+   ./run_macos.sh
+   ```
+5. If the scripts aren't executable, run `chmod +x setup_macos.sh run_macos.sh` once.
+6. If you ever get a segfault importing `shazamio_core` or a numpy build error, delete `Files/venv` and re-run `./setup_macos.sh`.
+
+### Linux / Raspberry Pi
+1. Install Python 3.12 and PortAudio (e.g. `sudo apt install portaudio19-dev python3-tk`).
+2. Create a virtual environment and install dependencies:
+   ```bash
+   cd v1.3/Files
+   python3.12 -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+3. Run SongPi:
+   ```bash
+   python shazam.py
+   ```
+
+### Audio input tips
+- SongPi needs a working microphone or audio input.
+- To identify your computer's *own* audio, set up a loopback device: "Stereo Mix" on Windows, VB-Cable, or BlackHole on macOS.
+- Leave `audio.device_index` as `null` to auto-select an input. SongPi logs the available devices at startup if you want to choose a specific one.
+
+---
+
+## Configuration
+
+All settings live in **`v1.3/Files/config.json`**. The defaults work well out of the box; the most useful settings are listed below.
+
+| Section | What it controls | Handy settings |
+|---|---|---|
+| `audio` | Recording setup | `device_index`, `record_seconds`, `sample_rate` |
+| `recognition` | Retry behaviour | `capture_attempts_per_cycle`, `extended_record_seconds`, `retry_delay_ms` |
+| `gui` | Look and motion | `blur_strength`, `vignette_intensity`, `accent_halo_intensity`, `ken_burns_enabled`, `motion_reduced`, `idle_splash_enabled`, `idle_splash_after_seconds`, `history_max_items` |
+| `lyrics` | Lyrics and cinematic layout | `enabled`, `prefer_synced_lyrics`, `show_plain_lyrics`, `offset_adjust_seconds`, `lines_visible`, `force_cinematic_mode`, `fullscreen_implies_cinematic_mode`, `enable_netease_fallback`, `cache_ttl_hours` |
+| `led` | Arduino LED strip | `enabled`, `port`, `brightness`, `saturation_multiplier`, `value_multiplier` |
+| `network` | Request timeouts and retries | `timeout`, `retry_count`, `retry_delay` |
+| `logging` | Log verbosity and format | `level` |
+
+**Lyrics running early or late?** Adjust `lyrics.offset_adjust_seconds`: positive values shift lyrics later, negative values shift them earlier.
+
+---
+
+## LED Strip Setup (optional)
+
+**You'll need:**
+- An Arduino Uno
+- A WS2812B strip (30 LEDs by default)
+- A 330–470 Ω resistor
+- A ~1000 µF capacitor
+- A separate 5 V power supply for the strip
+
+1. **Flash the firmware.** Open `v1.3/Arduino/SongPiLedStrip` as a [PlatformIO](https://platformio.org/) project and build/upload the `uno` environment. FastLED is installed automatically.
+2. **Wire it up.**
+   - Arduino **D6** → strip **DIN**, through the resistor.
+   - Arduino **GND** → strip power-supply **GND**. The shared ground is required.
+   - Power the strip from the **external 5 V supply**, not the Uno's 5 V pin.
+   - Put the capacitor across the strip's supply input.
+3. **Enable it in SongPi.** In `Files/config.json`, set `led.enabled` to `true` and `led.port` to your board's serial port: `COM3` on Windows, or `/dev/cu.usbmodem…` on macOS.
+4. **Tune it (optional).**
+   - `brightness` is 0–255.
+   - `saturation_multiplier` makes colours more vivid (`1.0` = unchanged, up to about `1.6`).
+   - `value_multiplier` brightens or dims the colour itself.
+   - If you change the LED count or data pin, update both the sketch constants and `pixel_count` / `data_pin` in the config.
+
+> ⚠️ The firmware caps power at **400 mA at 5 V** (`MAX_POWER_MILLIAMPS` in `src/main.cpp`). Never raise it above your power supply's continuous current rating.
+
+---
+
+## Troubleshooting
+
+- **No audio devices found / can't open device:** check that your mic is connected and enabled in system settings. Set `audio.device_index` to `null` to auto-select, or pick an index from the device list in the log.
+- **Songs aren't being recognised:** make the music louder or move the mic closer, and check your internet connection. Raising `recognition.extended_record_seconds` can help with quiet music.
+- **No lyrics for a song:** not every song has synced lyrics on LRCLIB or NetEase. Misses are cached for an hour and then retried. Set `lyrics.show_plain_lyrics` to `true` to show unsynced lyrics when timed ones aren't available.
+- **Animations are choppy (e.g. on a Pi):** set `gui.motion_reduced` to `true`.
+- **LED strip doesn't light up:**
+  - Check `led.port` and that the firmware is flashed.
+  - Confirm the shared ground between the Arduino and the strip supply.
+  - SongPi waits `led.reset_delay_seconds` (default 2 s) for the Uno to reboot after connecting.
+- **Crashes on startup on macOS/Python 3.13+:** use Python 3.12 and rebuild the venv (see macOS setup above).
+
+---
+
+## Running the Tests
+
+SongPi has a pytest suite covering the layout, typography, colour, timing, and LED helper logic.
+
+```bash
+cd v1.3/Files
+source venv/bin/activate      # Windows: venv\Scripts\activate
+pip install pytest
+pytest
+```
+
+---
+
+## Repository Layout
+
+| Path | What it is |
+|---|---|
+| `v1.3/` | **Current version**. Use this. |
+| `v1.3/Files/shazam.py` | The main app |
+| `v1.3/Files/led_controller.py` | Serial link to the Arduino LED strip |
+| `v1.3/Files/config.json` | Settings |
+| `v1.3/Files/tests/` | pytest suite |
+| `v1.3/Arduino/SongPiLedStrip/` | PlatformIO firmware for the LED strip |
+| `v1.1/`, `SongPi - Pi version/`, `SongPi - portable Windows/` | Older versions, kept for reference |
+| `RELEASE_LOG.md` | Detailed release notes |
+
+---
+
+## What's New
+
+### v1.3 (latest)
+
+**Lyrics and sync overhaul**
+- Lyrics now come from multiple sources: LRCLIB with smarter search and match scoring, plus a NetEase fallback.
+- Title and artist clean-up means far more songs find lyrics.
+- The lyric clock is anchored to when the audio was recorded, respects LRC offset tags, and is smoothed across repeated recognitions. Lyrics stay tightly in sync.
+- Lyrics are cached on disk, so songs you've heard before load their lyrics instantly.
+
+**Complete visual redesign**
+- Per-song accent colours from the album art, a radial vignette, an accent halo behind the cover, and an accent progress bar.
+- A drifting, crossfading "Ken Burns" backdrop, accent crossfades between tracks, a breathing glow on the active lyric, and slide/fade lyric transitions.
+- A status pill with a colour-coded, pulsing dot.
+- An idle splash screen when nothing is playing.
+- A responsive layout system (wide / mid / stacked) with a matching type scale.
+- Inter typography, a letter-spaced uppercase artist label, and word-safe text fitting so long names never overlap or break mid-word.
+- An automatic low-power profile for Raspberry Pi, plus a manual `motion_reduced` switch.
+
+**Album-colour LED lighting**
+- New Arduino/WS2812B firmware and a Python serial controller.
+- The strip mirrors the album's accent colour, with smooth 1-second fades and a built-in power cap.
+
+**Quality**
+- New pytest suite for the core display and LED logic.
+- Updated macOS setup and run scripts.
+- `pyserial` added to requirements.
+
+### v1.2
+- macOS support with dedicated setup and run scripts.
+- Time-synced lyrics from LRCLIB.
+- The first cinematic fullscreen layout, with album info and recent covers.
+- Multi-attempt recognition with longer retry recordings.
+- Song history that persists across restarts, rebuilt from older logs if needed.
+
+### v1.1
+- Visual song history panel with adaptive side/below layout and cached artwork.
+- The last song is remembered and restored on restart.
+- Smarter automatic audio device selection.
+- Better font scaling, placeholder art, expanded configuration, logging, and code clean-up.
+
+See [`RELEASE_LOG.md`](RELEASE_LOG.md) for full details.
