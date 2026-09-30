@@ -260,3 +260,9 @@ pytest
 - Better font scaling, placeholder art, expanded configuration, logging, and code clean-up.
 
 See [`RELEASE_LOG.md`](RELEASE_LOG.md) for full details.
+
+---
+
+## License
+
+SongPi is released under the [MIT License](LICENSE). See [`NOTICE.md`](NOTICE.md) for authors, third-party licenses, and a disclaimer about the external services, lyrics, and artwork SongPi uses.
