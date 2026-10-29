@@ -88,10 +88,28 @@ def _solid_with_patch(bg_rgb, patch_rgb, patch_box=(90, 90, 110, 110), size=(200
     return img
 
 
-def test_extract_dominant_color_picks_majority_over_vivid_minority():
-    # Near-white background (96%) with a small vivid green patch (4%).
-    img = _solid_with_patch((245, 245, 240), (0, 150, 80))
+def test_extract_dominant_color_prefers_vivid_minority_over_white_majority():
+    # Near-white background (~96%) with a small vivid green patch (~4%).
+    img = _solid_with_patch((245, 245, 240), (0, 150, 80), patch_box=(80, 80, 120, 120))
+    red, green, blue = shazam.hex_to_rgb(shazam.extract_dominant_color(img))
+    assert green > red and green > blue
+
+
+def test_extract_dominant_color_ignores_tiny_colorful_specks():
+    # A ~1% red speck is too small to represent the cover; white wins.
+    img = _solid_with_patch((245, 245, 240), (220, 20, 20))
     assert shazam.hex_to_rgb(shazam.extract_dominant_color(img)) == (245, 245, 240)
+
+
+def test_extract_dominant_color_uses_muted_majority_when_cover_has_no_color():
+    img = _solid_with_patch((200, 200, 195), (120, 120, 120))
+    assert shazam.hex_to_rgb(shazam.extract_dominant_color(img)) == (200, 200, 195)
+
+
+def test_extract_accent_color_prefers_vivid_minority_over_muted_white():
+    img = _solid_with_patch((215, 212, 205), (30, 90, 220), patch_box=(80, 80, 120, 120))
+    red, green, blue = shazam.hex_to_rgb(shazam.extract_accent_color(img))
+    assert blue > red and blue > green
 
 
 def test_extract_dominant_color_skips_black_for_next_most_used_color():

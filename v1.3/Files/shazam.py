@@ -665,34 +665,66 @@ def simulate_alpha_on_dark(value: str, alpha: float) -> str:
     return rgb_to_hex(mix_rgb(SCRIM_RGB, hex_to_rgb(value), alpha))
 
 
+# Palette tuning shared by the accent and LED pickers. Buckets below
+# COLORFUL_MIN_SATURATION (whites, greys, beiges) are only used when the cover
+# has no colorful bucket covering at least COLORFUL_MIN_SHARE of its pixels.
+PALETTE_SIZE = 16
+COLORFUL_MIN_SATURATION = 0.25
+COLORFUL_MIN_SHARE = 0.015
+NEAR_BLACK_MAX_CHANNEL = 40
+
+
+def quantize_palette(image: Image.Image) -> List[Tuple[int, Tuple[int, int, int]]]:
+    """Returns (pixel_count, rgb) buckets for the image, most populous first."""
+    thumb = image.convert("RGB").resize((96, 96), Image.Resampling.BILINEAR)
+    quant = thumb.quantize(colors=PALETTE_SIZE, method=Image.Quantize.MEDIANCUT)
+    palette = quant.getpalette() or []
+    counts = sorted(quant.getcolors() or [], reverse=True)
+    return [(count, tuple(palette[idx * 3:idx * 3 + 3])) for count, idx in counts]
+
+
+def rgb_saturation(rgb: Tuple[int, int, int]) -> float:
+    mx = max(rgb)
+    return (mx - min(rgb)) / mx if mx else 0.0
+
+
+def colorful_buckets(buckets: List[Tuple[int, Tuple[int, int, int]]]) -> List[Tuple[int, Tuple[int, int, int]]]:
+    """Filters to buckets that are saturated, not near-black, and big enough to matter."""
+    total = sum(count for count, _ in buckets) or 1
+    return [
+        (count, rgb) for count, rgb in buckets
+        if max(rgb) >= NEAR_BLACK_MAX_CHANNEL
+        and rgb_saturation(rgb) >= COLORFUL_MIN_SATURATION
+        and count / total >= COLORFUL_MIN_SHARE
+    ]
+
+
 def extract_accent_color(image: Image.Image) -> str:
     """Picks a vibrant accent color from the cover art.
 
     Quantizes to a small palette, then prefers colors with high
-    chroma (saturation × value). Falls back to a neutral indigo on
-    unusable images (monochrome, tiny, errors)."""
+    chroma (saturation × value). Whites and greys are only considered
+    when the cover has no colorful bucket. Falls back to a neutral indigo
+    on unusable images (monochrome, tiny, errors)."""
     try:
-        thumb = image.convert("RGB").resize((96, 96), Image.Resampling.BILINEAR)
-        quant = thumb.quantize(colors=8, method=Image.Quantize.MEDIANCUT)
-        palette = quant.getpalette() or []
-        counts = sorted(quant.getcolors() or [], reverse=True)
+        buckets = quantize_palette(image)
+        candidates = colorful_buckets(buckets)
+        if not candidates:
+            # Skip near-black and near-white (rarely make good accents).
+            candidates = [
+                (count, rgb) for count, rgb in buckets
+                if max(rgb) >= NEAR_BLACK_MAX_CHANNEL and min(rgb) <= 220
+            ]
         best_score = -1.0
         best_rgb = (124, 143, 255)
-        for count, idx in counts:
-            r = palette[idx * 3 + 0]
-            g = palette[idx * 3 + 1]
-            b = palette[idx * 3 + 2]
-            # Skip near-black and near-white (rarely make good accents).
-            mx = max(r, g, b); mn = min(r, g, b)
-            if mx < 40 or mn > 220:
-                continue
-            sat = (mx - mn) / mx if mx else 0
-            val = mx / 255.0
-            # Score: chroma weighted, mild popularity bias.
-            score = (sat * 0.7 + val * 0.3) * (count ** 0.3)
+        for count, rgb in candidates:
+            sat = rgb_saturation(rgb)
+            val = max(rgb) / 255.0
+            # Score: chroma weighted, weak popularity bias so vivid minorities win.
+            score = (sat * 0.8 + val * 0.2) * (count ** 0.15)
             if score > best_score:
                 best_score = score
-                best_rgb = (r, g, b)
+                best_rgb = rgb
         # Brighten low-luminance accents so they read on dark scrim.
         r, g, b = best_rgb
         mx = max(r, g, b)
@@ -705,41 +737,26 @@ def extract_accent_color(image: Image.Image) -> str:
         return "#7c8fff"
 
 
-NEAR_BLACK_MAX_CHANNEL = 40  # Matches extract_accent_color's near-black cutoff.
-
-
 def extract_dominant_color(image: Image.Image) -> str:
-    """Returns the cover art's true dominant color, by pixel population.
+    """Returns the cover art's most populous colorful color for the LED strip.
 
-    Unlike extract_accent_color (which deliberately discards near-black/
-    near-white buckets and biases toward saturated colors so the UI gets a
-    pleasant accent), this reports whatever color actually covers the most
-    pixels — including muted or near-white dominants. That's what the LED
-    strip should reproduce to match the album art.
-
-    Near-black is the one exception: a black-dominant cover (common for
-    minimalist/dark album art) would otherwise just turn the strip off, so
-    the next most-populous non-black bucket is used instead. If every
-    bucket is near-black, black wins anyway — there's no better option.
+    Whites, greys and other low-saturation buckets are skipped as long as
+    some saturated bucket covers at least COLORFUL_MIN_SHARE of the cover,
+    so a mostly-white cover with a colorful subject lights the strip in the
+    subject's color. Fully muted covers fall back to the most populous
+    non-black bucket; an all-black cover returns black.
     """
     try:
-        thumb = image.convert("RGB").resize((96, 96), Image.Resampling.BILINEAR)
-        quant = thumb.quantize(colors=8, method=Image.Quantize.MEDIANCUT)
-        palette = quant.getpalette() or []
-        counts = sorted(quant.getcolors() or [], reverse=True)
-        if not counts:
+        buckets = quantize_palette(image)
+        if not buckets:
             return "#7c8fff"
-        for _, idx in counts:
-            r = palette[idx * 3 + 0]
-            g = palette[idx * 3 + 1]
-            b = palette[idx * 3 + 2]
-            if max(r, g, b) >= NEAR_BLACK_MAX_CHANNEL:
-                return rgb_to_hex((r, g, b))
-        _, idx = counts[0]
-        r = palette[idx * 3 + 0]
-        g = palette[idx * 3 + 1]
-        b = palette[idx * 3 + 2]
-        return rgb_to_hex((r, g, b))
+        colorful = colorful_buckets(buckets)
+        if colorful:
+            return rgb_to_hex(colorful[0][1])
+        for _, rgb in buckets:
+            if max(rgb) >= NEAR_BLACK_MAX_CHANNEL:
+                return rgb_to_hex(rgb)
+        return rgb_to_hex(buckets[0][1])
     except Exception as e:
         logger.debug(f"Dominant color extraction failed: {e}")
         return "#7c8fff"

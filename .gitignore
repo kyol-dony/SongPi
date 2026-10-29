@@ -32,6 +32,8 @@ lyrics_cache.json
 docs/
 .claude/cache/
 **/.claude/cache/
+.claude/
+.codex/
 
 # Graphify generated knowledge graph
 graphify-out/
